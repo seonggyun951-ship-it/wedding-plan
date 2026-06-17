@@ -2,7 +2,6 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { createClient } from '@supabase/supabase-js'
 
-// ── Supabase 초기화 ──────────────────────────────────────────
 const supabase = createClient(
   'https://wqahhqssawaxynqigwtr.supabase.co',
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndxYWhocXNzYXdheHlucWlnd3RyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEzMjMwMjUsImV4cCI6MjA5Njg5OTAyNX0.b8d5YFUG7XSerEuCX0LygAU-JfOuxxB2T03Jaur0JjQ'
@@ -11,7 +10,6 @@ const supabase = createClient(
 const CATEGORIES = ['웨딩', '가전/가구', '예물/예단', '신혼여행', '기타']
 const CAT_COLORS = ['#ff6b6b', '#ffa94d', '#9775fa', '#4dabf7', '#69db7c']
 
-// ── 상태 ────────────────────────────────────────────────────
 const items = ref([])
 const budget = ref(30000000)
 const catBudgets = ref(Object.fromEntries(CATEGORIES.map(c => [c, 0])))
@@ -20,12 +18,20 @@ const currentCat = ref('')
 const editItem = ref(null)
 const showSettings = ref(false)
 const loading = ref(true)
-const saving = ref(false)
-const lastSaved = ref(null)
+const saveStatus = ref(null) // null | 'saving' | 'saved' | 'error'
 const newItem = ref({ name: '', planned: '', actual: '', paid: false, memo: '', date: '', vendor: '' })
 const APP_PASSWORD = 'tjdrbsalswl123'
 const isAuthorized = ref(false)
 const inputPassword = ref('')
+let toastTimer = null
+
+const setToast = (status) => {
+  saveStatus.value = status
+  if (toastTimer) clearTimeout(toastTimer)
+  if (status === 'saved' || status === 'error') {
+    toastTimer = setTimeout(() => { saveStatus.value = null }, 3000)
+  }
+}
 
 const login = async () => {
   if (inputPassword.value === APP_PASSWORD) {
@@ -36,14 +42,17 @@ const login = async () => {
     inputPassword.value = ''
   }
 }
+
 // ── 데이터 불러오기 ──────────────────────────────────────────
 const fetchAll = async () => {
   loading.value = true
   try {
-    const [{ data: itemsData }, { data: settingsData }] = await Promise.all([
+    const [{ data: itemsData, error: e1 }, { data: settingsData, error: e2 }] = await Promise.all([
       supabase.from('wedding_items').select('*').order('created_at'),
       supabase.from('wedding_settings').select('*')
     ])
+    if (e1) throw e1
+    if (e2) throw e2
     if (itemsData) items.value = itemsData
     if (settingsData) {
       settingsData.forEach(({ key, value }) => {
@@ -53,75 +62,105 @@ const fetchAll = async () => {
     }
   } catch (e) {
     console.error('불러오기 실패:', e)
+    alert('데이터 불러오기 실패: ' + e.message)
   }
   loading.value = false
 }
 
-// ── 설정 저장 ────────────────────────────────────────────────
+// ── 설정 저장 (onConflict: 'key' 필수) ───────────────────────
 const saveSettings = async () => {
-  saving.value = true
-  await Promise.all([
-    supabase.from('wedding_settings').upsert({ key: 'budget', value: budget.value }),
-    supabase.from('wedding_settings').upsert({ key: 'catBudgets', value: catBudgets.value })
-  ])
-  lastSaved.value = new Date()
-  saving.value = false
+  setToast('saving')
+  try {
+    const [{ error: e1 }, { error: e2 }] = await Promise.all([
+      supabase.from('wedding_settings').upsert({ key: 'budget', value: budget.value }, { onConflict: 'key' }),
+      supabase.from('wedding_settings').upsert({ key: 'catBudgets', value: catBudgets.value }, { onConflict: 'key' })
+    ])
+    if (e1) throw e1
+    if (e2) throw e2
+    setToast('saved')
+  } catch (e) {
+    console.error('설정 저장 실패:', e)
+    setToast('error')
+    alert('설정 저장 실패: ' + e.message)
+  }
 }
 
 // ── 항목 추가 ────────────────────────────────────────────────
 const addItem = async () => {
   if (!newItem.value.name.trim()) return
-  saving.value = true
+  setToast('saving')
   const payload = {
-    ...newItem.value,
+    name: newItem.value.name.trim(),
+    vendor: newItem.value.vendor,
     planned: Number(newItem.value.planned) || 0,
     actual: Number(newItem.value.actual) || 0,
+    paid: newItem.value.paid,
+    memo: newItem.value.memo,
+    date: newItem.value.date || null,
     category: currentCat.value
   }
   const { data, error } = await supabase.from('wedding_items').insert(payload).select().single()
   if (!error && data) {
     items.value.push(data)
     newItem.value = { name: '', planned: '', actual: '', paid: false, memo: '', date: '', vendor: '' }
-    lastSaved.value = new Date()
+    setToast('saved')
+  } else {
+    console.error('추가 실패:', error)
+    setToast('error')
+    alert('추가 실패: ' + error.message)
   }
-  saving.value = false
 }
 
 // ── 항목 삭제 ────────────────────────────────────────────────
 const deleteItem = async (id) => {
   if (!confirm('삭제할까요?')) return
-  saving.value = true
+  setToast('saving')
   const { error } = await supabase.from('wedding_items').delete().eq('id', id)
-  if (!error) items.value = items.value.filter(i => i.id !== id)
-  saving.value = false
+  if (!error) {
+    items.value = items.value.filter(i => i.id !== id)
+    setToast('saved')
+  } else {
+    console.error('삭제 실패:', error)
+    setToast('error')
+    alert('삭제 실패: ' + error.message)
+  }
 }
 
-// ── 항목 수정 저장 ────────────────────────────────────────────
+// ── 항목 수정 저장 (시스템 필드 제외, 성공 시에만 닫기) ────────
 const saveEdit = async () => {
-  saving.value = true
+  setToast('saving')
+  const { id, created_at, ...fields } = editItem.value
   const payload = {
-    ...editItem.value,
-    planned: Number(editItem.value.planned) || 0,
-    actual: Number(editItem.value.actual) || 0
+    ...fields,
+    name: fields.name?.trim(),
+    planned: Number(fields.planned) || 0,
+    actual: Number(fields.actual) || 0,
   }
-  const { error } = await supabase.from('wedding_items').update(payload).eq('id', payload.id)
+  const { error } = await supabase.from('wedding_items').update(payload).eq('id', id)
   if (!error) {
-    const idx = items.value.findIndex(i => i.id === payload.id)
-    if (idx >= 0) items.value[idx] = payload
-    lastSaved.value = new Date()
+    const idx = items.value.findIndex(i => i.id === id)
+    if (idx >= 0) items.value[idx] = { id, created_at, ...payload }
+    setToast('saved')
+    editItem.value = null
+  } else {
+    console.error('수정 실패:', error)
+    setToast('error')
+    alert('수정 실패: ' + error.message)
   }
-  editItem.value = null
-  saving.value = false
 }
 
 // ── 결제 완료 토글 ────────────────────────────────────────────
 const togglePaid = async (item) => {
   const newPaid = !item.paid
-  await supabase.from('wedding_items').update({ paid: newPaid }).eq('id', item.id)
-  item.paid = newPaid
+  const { error } = await supabase.from('wedding_items').update({ paid: newPaid }).eq('id', item.id)
+  if (!error) {
+    item.paid = newPaid
+  } else {
+    alert('상태 변경 실패: ' + error.message)
+  }
 }
 
-// ── 실시간 동기화 (파트너가 수정해도 내 화면 자동 갱신) ────────
+// ── 실시간 동기화 ────────────────────────────────────────────
 let channel
 onMounted(async () => {
   channel = supabase
@@ -144,7 +183,10 @@ onMounted(async () => {
     )
     .subscribe()
 })
-onUnmounted(() => { if (channel) supabase.removeChannel(channel) })
+onUnmounted(() => {
+  if (channel) supabase.removeChannel(channel)
+  if (toastTimer) clearTimeout(toastTimer)
+})
 
 // ── 계산 ────────────────────────────────────────────────────
 const catItems = (cat) => items.value.filter(i => i.category === cat)
@@ -180,227 +222,231 @@ function arcPath(cx, cy, r, sa, ea) {
 const fmt = n => Number(n || 0).toLocaleString()
 const pct = (a, b) => b ? Math.round(a / b * 100) : 0
 const diff = (a, b) => Number(a || 0) - Number(b || 0)
-const fmtTime = (d) => d ? `${d.getHours()}:${String(d.getMinutes()).padStart(2,'0')} 저장됨` : ''
 </script>
 
 <template>
   <div class="app">
-<div v-if="!isAuthorized" class="login-screen">
-  <div class="login-box">
-    <h1>💍</h1>
-    <h2>우리만의 결혼 준비</h2>
-    <input v-model="inputPassword" type="password" maxlength="15" placeholder="비밀번호 입력" @keyup.enter="login" class="pw-input" />
-    <button @click="login" class="btn-login">입장하기</button>
-  </div>
-</div>
-<template v-else>
-    <!-- 로딩 -->
-    <div v-if="loading" class="loading-screen">
-      <div class="spinner"></div>
-      <p>데이터 불러오는 중...</p>
+    <!-- 로그인 화면 -->
+    <div v-if="!isAuthorized" class="login-screen">
+      <div class="login-box">
+        <h1>💍</h1>
+        <h2>우리만의 결혼 준비</h2>
+        <input v-model="inputPassword" type="password" maxlength="15" placeholder="비밀번호 입력" @keyup.enter="login" class="pw-input" />
+        <button @click="login" class="btn-login">입장하기</button>
+      </div>
     </div>
 
     <template v-else>
-</template>
-    <!-- 저장 상태 토스트 -->
-    <div class="toast" :class="{ visible: saving || lastSaved }">
-      <span v-if="saving">💾 저장 중...</span>
-      <span v-else-if="lastSaved">✅ {{ fmtTime(lastSaved) }}</span>
-    </div>
-
-    <!-- ───── HOME VIEW ───── -->
-    <div v-if="view === 'home'">
-      <div class="title-row">
-        <h1>💍 결혼 준비</h1>
-        <button class="settings-btn" @click="showSettings = !showSettings" :class="{ active: showSettings }">⚙️</button>
+      <!-- 로딩 -->
+      <div v-if="loading" class="loading-screen">
+        <div class="spinner"></div>
+        <p>데이터 불러오는 중...</p>
       </div>
 
-      <!-- 총 예산 카드 -->
-      <div class="budget-card" :class="{ over: overBudget }">
-        <div class="budget-top">
-          <div>
-            <small>총 예산</small>
-            <div v-if="showSettings" class="budget-edit-row">
-              <input v-model.number="budget" type="number" class="budget-input" @blur="saveSettings" />
-              <span>원</span>
+      <template v-else>
+        <!-- 저장 상태 토스트 -->
+        <div class="toast" :class="{ visible: saveStatus }">
+          <span v-if="saveStatus === 'saving'">💾 저장 중...</span>
+          <span v-else-if="saveStatus === 'saved'">✅ 저장됨</span>
+          <span v-else-if="saveStatus === 'error'">❌ 저장 실패</span>
+        </div>
+
+        <!-- ───── HOME VIEW ───── -->
+        <div v-if="view === 'home'">
+          <div class="title-row">
+            <h1>💍 결혼 준비</h1>
+            <button class="settings-btn" @click="showSettings = !showSettings" :class="{ active: showSettings }">⚙️</button>
+          </div>
+
+          <!-- 총 예산 카드 -->
+          <div class="budget-card" :class="{ over: overBudget }">
+            <div class="budget-top">
+              <div>
+                <small>총 예산</small>
+                <div v-if="showSettings" class="budget-edit-row">
+                  <input v-model.number="budget" type="number" class="budget-input" @change="saveSettings" />
+                  <span>원</span>
+                </div>
+                <div v-else class="big-num">{{ fmt(budget) }}원</div>
+              </div>
+              <span class="badge-label">{{ overBudget ? '⚠️ 초과' : '✅ 여유' }}</span>
             </div>
-            <div v-else class="big-num">{{ fmt(budget) }}원</div>
-          </div>
-          <span class="badge-label">{{ overBudget ? '⚠️ 초과' : '✅ 여유' }}</span>
-        </div>
-        <div class="progress-bar">
-          <div class="progress-fill" :style="{ width: totalProgress + '%', background: overBudget ? '#ff4757' : '#a9e34b' }"></div>
-        </div>
-        <div class="budget-stats">
-          <div><small>지출</small><span :class="{ red: overBudget }">{{ fmt(totalActual) }}원</span></div>
-          <div><small>계획</small><span>{{ fmt(totalPlanned) }}원</span></div>
-          <div><small>잔액</small><span :class="overBudget ? 'red' : 'green'">{{ fmt(balance) }}원</span></div>
-        </div>
-      </div>
-
-      <!-- 카테고리 예산 설정 -->
-      <div v-if="showSettings" class="settings-panel">
-        <p class="panel-title">카테고리별 예산 설정</p>
-        <div v-for="(cat, i) in CATEGORIES" :key="cat" class="setting-row">
-          <span class="cat-dot" :style="{ background: CAT_COLORS[i] }"></span>
-          <span class="setting-label">{{ cat }}</span>
-          <input v-model.number="catBudgets[cat]" type="number" class="setting-input" @blur="saveSettings" />
-          <span class="won">원</span>
-        </div>
-        <button class="save-btn" @click="saveSettings">
-          {{ saving ? '저장 중...' : '💾 설정 저장' }}
-        </button>
-      </div>
-
-      <!-- 파이 차트 -->
-      <div v-if="totalActual > 0" class="chart-card">
-        <p class="panel-title">지출 현황</p>
-        <div class="chart-wrap">
-          <svg viewBox="0 0 200 200" width="160" height="160">
-            <path v-for="seg in pieData" :key="seg.cat" :d="seg.d" :fill="seg.color" stroke="white" stroke-width="2.5" />
-            <circle cx="100" cy="100" r="44" fill="white" />
-            <text x="100" y="96" text-anchor="middle" font-size="10" fill="#888">총지출</text>
-            <text x="100" y="114" text-anchor="middle" font-size="11" fill="#333" font-weight="bold">{{ Math.round(totalActual / 10000) }}만원</text>
-          </svg>
-          <div class="legend">
-            <div v-for="(cat, i) in CATEGORIES" :key="cat" v-show="catActual(cat) > 0" class="legend-row">
-              <span class="leg-dot" :style="{ background: CAT_COLORS[i] }"></span>
-              <span class="leg-cat">{{ cat }}</span>
-              <span class="leg-pct">{{ pct(catActual(cat), totalActual) }}%</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- 카테고리 카드 -->
-      <p class="panel-title">카테고리별 현황</p>
-      <div class="cat-grid">
-        <div v-for="(cat, i) in CATEGORIES" :key="cat"
-          class="cat-card" :class="{ over: catOver(cat) }"
-          @click="currentCat = cat; view = 'detail'">
-          <div class="cat-top">
-            <span class="cat-icon" :style="{ color: CAT_COLORS[i] }">●</span>
-            <span class="cat-name">{{ cat }}</span>
-            <span v-if="catOver(cat)" class="over-badge">초과!</span>
-          </div>
-          <div class="cat-nums">
-            <div class="num-row"><span>계획</span><span>{{ fmt(catPlanned(cat)) }}</span></div>
-            <div class="num-row"><span>지출</span><span :class="{ red: catOver(cat) }">{{ fmt(catActual(cat)) }}</span></div>
-            <div class="num-row diff-row">
-              <span>차이</span>
-              <span :class="diff(catPlanned(cat), catActual(cat)) >= 0 ? 'green' : 'red'">
-                {{ diff(catPlanned(cat), catActual(cat)) >= 0 ? '+' : '' }}{{ fmt(diff(catPlanned(cat), catActual(cat))) }}
-              </span>
-            </div>
-          </div>
-          <div v-if="catBudgets[cat] > 0" class="cat-progress-wrap">
             <div class="progress-bar">
-              <div class="progress-fill" :style="{ width: catProgress(cat) + '%', background: catOver(cat) ? '#ff4757' : CAT_COLORS[i] }"></div>
+              <div class="progress-fill" :style="{ width: totalProgress + '%', background: overBudget ? '#ff4757' : '#a9e34b' }"></div>
             </div>
-            <small>{{ Math.round(catProgress(cat)) }}% 사용</small>
-          </div>
-          <small class="item-cnt">{{ catItems(cat).length }}개 항목</small>
-        </div>
-      </div>
-    </div>
-
-    <!-- ───── DETAIL VIEW ───── -->
-    <div v-else class="detail-view">
-      <div class="detail-header">
-        <button @click="view = 'home'" class="back-btn">← 뒤로</button>
-        <h2>{{ currentCat }}</h2>
-        <span v-if="catOver(currentCat)" class="over-badge">예산 초과!</span>
-      </div>
-
-      <div class="summary-card" :class="{ over: catOver(currentCat) }">
-        <div class="sum-row"><span>계획 합계</span><strong>{{ fmt(catPlanned(currentCat)) }}원</strong></div>
-        <div class="sum-row"><span>실제 지출</span><strong :class="{ red: catOver(currentCat) }">{{ fmt(catActual(currentCat)) }}원</strong></div>
-        <div class="sum-row">
-          <span>예상 대비</span>
-          <strong :class="diff(catPlanned(currentCat), catActual(currentCat)) >= 0 ? 'green' : 'red'">
-            {{ diff(catPlanned(currentCat), catActual(currentCat)) >= 0 ? '절약 ' : '초과 ' }}
-            {{ fmt(Math.abs(diff(catPlanned(currentCat), catActual(currentCat)))) }}원
-          </strong>
-        </div>
-        <div v-if="catBudgets[currentCat] > 0">
-          <div class="progress-bar mt8">
-            <div class="progress-fill" :style="{ width: catProgress(currentCat) + '%', background: catOver(currentCat) ? '#ff4757' : '#ff6b6b' }"></div>
-          </div>
-          <small>예산 {{ fmt(catBudgets[currentCat]) }}원 중 {{ Math.round(catProgress(currentCat)) }}% 사용</small>
-        </div>
-      </div>
-
-      <!-- 항목 추가 폼 -->
-      <div class="add-form">
-        <p class="panel-title">항목 추가</p>
-        <input v-model="newItem.name" placeholder="항목명 *" class="full-input" />
-        <input v-model="newItem.vendor" placeholder="업체명" class="full-input" />
-        <div class="row2">
-          <input v-model.number="newItem.planned" type="number" placeholder="예상 금액" />
-          <input v-model.number="newItem.actual" type="number" placeholder="실제 금액" />
-        </div>
-        <div class="row2">
-          <input v-model="newItem.date" type="date" style="flex:1" />
-          <label class="paid-label"><input type="checkbox" v-model="newItem.paid" /> 결제완료</label>
-        </div>
-        <textarea v-model="newItem.memo" placeholder="메모" class="full-input memo"></textarea>
-        <button @click="addItem" class="btn-add" :disabled="saving">
-          {{ saving ? '저장 중...' : '+ 추가하기' }}
-        </button>
-      </div>
-
-      <!-- 항목 목록 -->
-      <p class="panel-title">항목 목록 ({{ catItems(currentCat).length }}개)</p>
-      <div class="items-list">
-        <div v-for="item in catItems(currentCat)" :key="item.id" class="item-card" :class="{ paid: item.paid }">
-          <div class="item-top">
-            <div class="item-left">
-              <input type="checkbox" :checked="item.paid" @change="togglePaid(item)" class="paid-check" />
-              <span class="item-name" :class="{ strikethrough: item.paid }">{{ item.name }}</span>
-              <span v-if="item.vendor" class="vendor-tag">{{ item.vendor }}</span>
-              <span v-if="item.paid" class="paid-tag">결제완료</span>
-            </div>
-            <div class="item-actions">
-              <button @click="editItem = { ...item }" class="btn-icon">✏️</button>
-              <button @click="deleteItem(item.id)" class="btn-icon">🗑️</button>
+            <div class="budget-stats">
+              <div><small>지출</small><span :class="{ red: overBudget }">{{ fmt(totalActual) }}원</span></div>
+              <div><small>계획</small><span>{{ fmt(totalPlanned) }}원</span></div>
+              <div><small>잔액</small><span :class="overBudget ? 'red' : 'green'">{{ fmt(balance) }}원</span></div>
             </div>
           </div>
-          <div class="item-prices">
-            <span>예상 {{ fmt(item.planned) }}원</span>
-            <span class="act-price">지출 {{ fmt(item.actual) }}원</span>
-            <span :class="diff(item.planned, item.actual) >= 0 ? 'green' : 'red'">
-              {{ diff(item.planned, item.actual) >= 0 ? '▼절약 ' : '▲초과 ' }}{{ fmt(Math.abs(diff(item.planned, item.actual))) }}원
-            </span>
+
+          <!-- 카테고리 예산 설정 -->
+          <div v-if="showSettings" class="settings-panel">
+            <p class="panel-title">카테고리별 예산 설정</p>
+            <div v-for="(cat, i) in CATEGORIES" :key="cat" class="setting-row">
+              <span class="cat-dot" :style="{ background: CAT_COLORS[i] }"></span>
+              <span class="setting-label">{{ cat }}</span>
+              <input v-model.number="catBudgets[cat]" type="number" class="setting-input" @change="saveSettings" />
+              <span class="won">원</span>
+            </div>
+            <button class="save-btn" @click="saveSettings">
+              {{ saveStatus === 'saving' ? '저장 중...' : '💾 설정 저장' }}
+            </button>
           </div>
-          <div v-if="item.date" class="item-meta">📅 {{ item.date }}</div>
-          <div v-if="item.memo" class="item-memo">💬 {{ item.memo }}</div>
-        </div>
-        <div v-if="catItems(currentCat).length === 0" class="empty-state">
-          <span>📝</span><p>아직 항목이 없어요. 위에서 추가해보세요!</p>
-        </div>
-      </div>
-    </div>
 
-    <!-- ───── 수정 모달 ───── -->
-    <div v-if="editItem" class="modal-overlay" @click.self="editItem = null">
-      <div class="modal">
-        <h3>항목 수정</h3>
-        <input v-model="editItem.name" placeholder="항목명" class="full-input" />
-        <input v-model="editItem.vendor" placeholder="업체명" class="full-input" />
-        <div class="row2">
-          <input v-model.number="editItem.planned" type="number" placeholder="예상 금액" />
-          <input v-model.number="editItem.actual" type="number" placeholder="실제 금액" />
-        </div>
-        <input v-model="editItem.date" type="date" class="full-input" />
-        <textarea v-model="editItem.memo" placeholder="메모" class="full-input memo"></textarea>
-        <label class="paid-label"><input type="checkbox" v-model="editItem.paid" /> 결제완료</label>
-        <div class="modal-btns">
-          <button @click="editItem = null" class="btn-cancel">취소</button>
-          <button @click="saveEdit" class="btn-save" :disabled="saving">{{ saving ? '저장 중...' : '저장' }}</button>
-        </div>
-      </div>
-    </div>
+          <!-- 파이 차트 -->
+          <div v-if="totalActual > 0" class="chart-card">
+            <p class="panel-title">지출 현황</p>
+            <div class="chart-wrap">
+              <svg viewBox="0 0 200 200" width="160" height="160">
+                <path v-for="seg in pieData" :key="seg.cat" :d="seg.d" :fill="seg.color" stroke="white" stroke-width="2.5" />
+                <circle cx="100" cy="100" r="44" fill="white" />
+                <text x="100" y="96" text-anchor="middle" font-size="10" fill="#888">총지출</text>
+                <text x="100" y="114" text-anchor="middle" font-size="11" fill="#333" font-weight="bold">{{ Math.round(totalActual / 10000) }}만원</text>
+              </svg>
+              <div class="legend">
+                <div v-for="(cat, i) in CATEGORIES" :key="cat" v-show="catActual(cat) > 0" class="legend-row">
+                  <span class="leg-dot" :style="{ background: CAT_COLORS[i] }"></span>
+                  <span class="leg-cat">{{ cat }}</span>
+                  <span class="leg-pct">{{ pct(catActual(cat), totalActual) }}%</span>
+                </div>
+              </div>
+            </div>
+          </div>
 
+          <!-- 카테고리 카드 -->
+          <p class="panel-title">카테고리별 현황</p>
+          <div class="cat-grid">
+            <div v-for="(cat, i) in CATEGORIES" :key="cat"
+              class="cat-card" :class="{ over: catOver(cat) }"
+              @click="currentCat = cat; view = 'detail'">
+              <div class="cat-top">
+                <span class="cat-icon" :style="{ color: CAT_COLORS[i] }">●</span>
+                <span class="cat-name">{{ cat }}</span>
+                <span v-if="catOver(cat)" class="over-badge">초과!</span>
+              </div>
+              <div class="cat-nums">
+                <div class="num-row"><span>계획</span><span>{{ fmt(catPlanned(cat)) }}</span></div>
+                <div class="num-row"><span>지출</span><span :class="{ red: catOver(cat) }">{{ fmt(catActual(cat)) }}</span></div>
+                <div class="num-row diff-row">
+                  <span>차이</span>
+                  <span :class="diff(catPlanned(cat), catActual(cat)) >= 0 ? 'green' : 'red'">
+                    {{ diff(catPlanned(cat), catActual(cat)) >= 0 ? '+' : '' }}{{ fmt(diff(catPlanned(cat), catActual(cat))) }}
+                  </span>
+                </div>
+              </div>
+              <div v-if="catBudgets[cat] > 0" class="cat-progress-wrap">
+                <div class="progress-bar">
+                  <div class="progress-fill" :style="{ width: catProgress(cat) + '%', background: catOver(cat) ? '#ff4757' : CAT_COLORS[i] }"></div>
+                </div>
+                <small>{{ Math.round(catProgress(cat)) }}% 사용</small>
+              </div>
+              <small class="item-cnt">{{ catItems(cat).length }}개 항목</small>
+            </div>
+          </div>
+        </div>
+
+        <!-- ───── DETAIL VIEW ───── -->
+        <div v-else class="detail-view">
+          <div class="detail-header">
+            <button @click="view = 'home'" class="back-btn">← 뒤로</button>
+            <h2>{{ currentCat }}</h2>
+            <span v-if="catOver(currentCat)" class="over-badge">예산 초과!</span>
+          </div>
+
+          <div class="summary-card" :class="{ over: catOver(currentCat) }">
+            <div class="sum-row"><span>계획 합계</span><strong>{{ fmt(catPlanned(currentCat)) }}원</strong></div>
+            <div class="sum-row"><span>실제 지출</span><strong :class="{ red: catOver(currentCat) }">{{ fmt(catActual(currentCat)) }}원</strong></div>
+            <div class="sum-row">
+              <span>예상 대비</span>
+              <strong :class="diff(catPlanned(currentCat), catActual(currentCat)) >= 0 ? 'green' : 'red'">
+                {{ diff(catPlanned(currentCat), catActual(currentCat)) >= 0 ? '절약 ' : '초과 ' }}
+                {{ fmt(Math.abs(diff(catPlanned(currentCat), catActual(currentCat)))) }}원
+              </strong>
+            </div>
+            <div v-if="catBudgets[currentCat] > 0">
+              <div class="progress-bar mt8">
+                <div class="progress-fill" :style="{ width: catProgress(currentCat) + '%', background: catOver(currentCat) ? '#ff4757' : '#ff6b6b' }"></div>
+              </div>
+              <small>예산 {{ fmt(catBudgets[currentCat]) }}원 중 {{ Math.round(catProgress(currentCat)) }}% 사용</small>
+            </div>
+          </div>
+
+          <!-- 항목 추가 폼 -->
+          <div class="add-form">
+            <p class="panel-title">항목 추가</p>
+            <input v-model="newItem.name" placeholder="항목명 *" class="full-input" />
+            <input v-model="newItem.vendor" placeholder="업체명" class="full-input" />
+            <div class="row2">
+              <input v-model.number="newItem.planned" type="number" placeholder="예상 금액" />
+              <input v-model.number="newItem.actual" type="number" placeholder="실제 금액" />
+            </div>
+            <div class="row2">
+              <input v-model="newItem.date" type="date" style="flex:1" />
+              <label class="paid-label"><input type="checkbox" v-model="newItem.paid" /> 결제완료</label>
+            </div>
+            <textarea v-model="newItem.memo" placeholder="메모" class="full-input memo"></textarea>
+            <button @click="addItem" class="btn-add" :disabled="saveStatus === 'saving'">
+              {{ saveStatus === 'saving' ? '저장 중...' : '+ 추가하기' }}
+            </button>
+          </div>
+
+          <!-- 항목 목록 -->
+          <p class="panel-title">항목 목록 ({{ catItems(currentCat).length }}개)</p>
+          <div class="items-list">
+            <div v-for="item in catItems(currentCat)" :key="item.id" class="item-card" :class="{ paid: item.paid }">
+              <div class="item-top">
+                <div class="item-left">
+                  <input type="checkbox" :checked="item.paid" @change="togglePaid(item)" class="paid-check" />
+                  <span class="item-name" :class="{ strikethrough: item.paid }">{{ item.name }}</span>
+                  <span v-if="item.vendor" class="vendor-tag">{{ item.vendor }}</span>
+                  <span v-if="item.paid" class="paid-tag">결제완료</span>
+                </div>
+                <div class="item-actions">
+                  <button @click="editItem = { ...item }" class="btn-icon">✏️</button>
+                  <button @click="deleteItem(item.id)" class="btn-icon">🗑️</button>
+                </div>
+              </div>
+              <div class="item-prices">
+                <span>예상 {{ fmt(item.planned) }}원</span>
+                <span class="act-price">지출 {{ fmt(item.actual) }}원</span>
+                <span :class="diff(item.planned, item.actual) >= 0 ? 'green' : 'red'">
+                  {{ diff(item.planned, item.actual) >= 0 ? '▼절약 ' : '▲초과 ' }}{{ fmt(Math.abs(diff(item.planned, item.actual))) }}원
+                </span>
+              </div>
+              <div v-if="item.date" class="item-meta">📅 {{ item.date }}</div>
+              <div v-if="item.memo" class="item-memo">💬 {{ item.memo }}</div>
+            </div>
+            <div v-if="catItems(currentCat).length === 0" class="empty-state">
+              <span>📝</span><p>아직 항목이 없어요. 위에서 추가해보세요!</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- ───── 수정 모달 ───── -->
+        <div v-if="editItem" class="modal-overlay" @click.self="editItem = null">
+          <div class="modal">
+            <h3>항목 수정</h3>
+            <input v-model="editItem.name" placeholder="항목명" class="full-input" />
+            <input v-model="editItem.vendor" placeholder="업체명" class="full-input" />
+            <div class="row2">
+              <input v-model.number="editItem.planned" type="number" placeholder="예상 금액" />
+              <input v-model.number="editItem.actual" type="number" placeholder="실제 금액" />
+            </div>
+            <input v-model="editItem.date" type="date" class="full-input" />
+            <textarea v-model="editItem.memo" placeholder="메모" class="full-input memo"></textarea>
+            <label class="paid-label"><input type="checkbox" v-model="editItem.paid" /> 결제완료</label>
+            <div class="modal-btns">
+              <button @click="editItem = null" class="btn-cancel">취소</button>
+              <button @click="saveEdit" class="btn-save" :disabled="saveStatus === 'saving'">
+                {{ saveStatus === 'saving' ? '저장 중...' : '저장' }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+      </template>
     </template>
   </div>
 </template>
