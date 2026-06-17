@@ -13,7 +13,7 @@ const PRESET_ICONS  = ['💍','🛋️','💎','✈️','📦','👗','🍽️',
 // ── 인증 ────────────────────────────────────────────────────
 const isAuthorized = ref(false)
 const inputPassword = ref('')
-const APP_PASSWORD = 'tjdrbsalswl123'
+const EDGE_FUNCTION_URL = 'https://wqahhqssawaxynqigwtr.supabase.co/functions/v1/smooth-action'
 
 // ── 데이터 ──────────────────────────────────────────────────
 const categories = ref([])   // { id, name, color, icon, sort_order }
@@ -48,8 +48,16 @@ const setToast = (s) => {
 
 // ── 로그인 ──────────────────────────────────────────────────
 const login = async () => {
-  if (inputPassword.value === APP_PASSWORD) { isAuthorized.value = true; await fetchAll() }
-  else { alert('비밀번호가 틀렸습니다!'); inputPassword.value = '' }
+  try {
+    const res = await fetch(EDGE_FUNCTION_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: inputPassword.value, app: 'wedding' })
+    })
+    const { ok } = await res.json()
+    if (ok) { isAuthorized.value = true; await fetchAll() }
+    else { alert('비밀번호가 틀렸습니다!'); inputPassword.value = '' }
+  } catch { alert('인증 서버 오류, 다시 시도해주세요.') }
 }
 
 // ── 전체 데이터 불러오기 ─────────────────────────────────────
