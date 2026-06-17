@@ -3,8 +3,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient(
-  'https://wqahhqssawaxynqigwtr.supabase.co',
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndxYWhocXNzYXdheHlucWlnd3RyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODEzMjMwMjUsImV4cCI6MjA5Njg5OTAyNX0.b8d5YFUG7XSerEuCX0LygAU-JfOuxxB2T03Jaur0JjQ'
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_KEY
 )
 
 const PRESET_COLORS = ['#ff6b6b','#ffa94d','#ffd43b','#a9e34b','#69db7c','#38d9a9','#4dabf7','#748ffc','#9775fa','#f783ac','#adb5bd','#495057']
