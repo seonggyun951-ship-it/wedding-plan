@@ -238,9 +238,13 @@ const deleteLink = async (id) => {
 }
 
 // ── 체크리스트 ───────────────────────────────────────────────
+const CHECK_PERIODS = ['연', '월', '주', '일']
+const checkPeriod = ref('일')
+const newCheckPeriod = ref('일')
+const filteredChecklist = computed(() => checklist.value.filter(c => c.period === checkPeriod.value))
 const addCheck = async () => {
   if (!newCheckText.value.trim()) return
-  const { data, error } = await supabase.from('wedding_checklist').insert({ text: newCheckText.value.trim(), done: false }).select().single()
+  const { data, error } = await supabase.from('wedding_checklist').insert({ text: newCheckText.value.trim(), done: false, period: newCheckPeriod.value }).select().single()
   if (!error && data) { checklist.value.push(data); newCheckText.value = '' }
   else alert('추가 실패: ' + error?.message)
 }
@@ -288,7 +292,7 @@ const overBudget   = computed(() => balance.value < 0)
 const totalProgress= computed(() => budget.value ? Math.min(totalActual.value/budget.value*100,100) : 0)
 const catProgress  = (name) => { const b=catBudgets.value[name]; return b ? Math.min(catActual(name)/b*100,100) : 0 }
 const catOver      = (name) => catBudgets.value[name]>0 && catActual(name)>catBudgets.value[name]
-const checkDoneCount = computed(() => checklist.value.filter(c=>c.done).length)
+const checkDoneCount = computed(() => filteredChecklist.value.filter(c=>c.done).length)
 
 const pieData = computed(() => {
   const total = totalActual.value; if (!total) return []
@@ -545,19 +549,28 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
           <template v-else>
             <div class="check-header">
               <p class="section-title" style="margin:0">할 일 목록</p>
-              <span class="check-count">{{ checkDoneCount }}/{{ checklist.length }} 완료</span>
+              <span class="check-count">{{ checkDoneCount }}/{{ filteredChecklist.length }} 완료</span>
+            </div>
+            <!-- 기간 탭 -->
+            <div class="period-tabs">
+              <button v-for="p in CHECK_PERIODS" :key="p"
+                class="period-tab" :class="{ active: checkPeriod===p }"
+                @click="checkPeriod=p">{{ p }}</button>
             </div>
             <div class="check-add-row">
               <input v-model="newCheckText" placeholder="할 일 추가..." class="check-input" @keyup.enter="addCheck" />
+              <select v-model="newCheckPeriod" class="period-select">
+                <option v-for="p in CHECK_PERIODS" :key="p" :value="p">{{ p }}</option>
+              </select>
               <button @click="addCheck" class="btn-check-add">추가</button>
             </div>
             <div class="check-list">
-              <div v-for="item in checklist" :key="item.id" class="check-item" :class="{ done: item.done }">
+              <div v-for="item in filteredChecklist" :key="item.id" class="check-item" :class="{ done: item.done }">
                 <input type="checkbox" :checked="item.done" @change="toggleCheck(item)" class="check-checkbox" />
                 <span class="check-text" :class="{ strikethrough: item.done }">{{ item.text }}</span>
                 <button @click="deleteCheck(item.id)" class="btn-check-del">✕</button>
               </div>
-              <div v-if="checklist.length===0" class="empty-state">
+              <div v-if="filteredChecklist.length===0" class="empty-state">
                 <div>✅</div><p>할 일을 추가해보세요!</p>
               </div>
             </div>
@@ -858,6 +871,10 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
 .item-memo { font-size: 13px; color: #666; margin-top: 6px; padding: 8px 10px; background: #fafafa; border-radius: 8px; }
 
 /* 체크리스트 */
+.period-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+.period-tab { flex: 1; padding: 8px; border: 1.5px solid #eee; border-radius: 10px; background: white; font-size: 14px; font-weight: 600; color: #bbb; cursor: pointer; }
+.period-tab.active { border-color: #ff6b6b; color: #ff6b6b; background: #fff3f3; }
+.period-select { padding: 0 8px; border: 1px solid #eee; border-radius: 12px; font-size: 14px; background: white; color: #555; height: 48px; }
 .check-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .check-count { font-size: 13px; color: #ff6b6b; font-weight: 700; }
 .check-add-row { display: flex; gap: 8px; margin-bottom: 12px; }
