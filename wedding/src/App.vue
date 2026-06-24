@@ -20,6 +20,9 @@ const categories = ref([])   // { id, name, color, icon, sort_order }
 const items      = ref([])
 const checklist  = ref([])
 const budget     = ref(30000000)
+const reLinks    = ref([])
+const showAddLink = ref(false)
+const newLink    = ref({ region:'', title:'', url:'', memo:'' })
 const catBudgets = ref({})
 
 // ── UI 상태 ─────────────────────────────────────────────────
@@ -74,16 +77,18 @@ const fetchAll = async () => {
 
     const defaultBudgets = Object.fromEntries(categories.value.map(c => [c.name, 0]))
 
-    const [{ data: itemsData, error: e1 }, { data: settingsData, error: e2 }, { data: checkData }] = await Promise.all([
+    const [{ data: itemsData, error: e1 }, { data: settingsData, error: e2 }, { data: checkData }, { data: reData }] = await Promise.all([
       supabase.from('wedding_items').select('*').order('created_at'),
       supabase.from('wedding_settings').select('*'),
-      supabase.from('wedding_checklist').select('*').order('created_at')
+      supabase.from('wedding_checklist').select('*').order('created_at'),
+      supabase.from('realestate_links').select('*').order('created_at', { ascending: false })
     ])
     if (e1) throw e1
     if (e2) throw e2
 
     if (itemsData) items.value = itemsData
     if (checkData)  checklist.value = checkData
+    if (reData)     reLinks.value   = reData
     if (settingsData) settingsData.forEach(({ key, value }) => {
       if (key === 'budget')     budget.value = Number(value)
       if (key === 'catBudgets') catBudgets.value = { ...defaultBudgets, ...value }
@@ -214,6 +219,22 @@ const togglePaid = async (item) => {
   const newPaid = !item.paid
   const { error } = await supabase.from('wedding_items').update({ paid: newPaid }).eq('id', item.id)
   if (!error) item.paid = newPaid
+}
+
+// ── 부동산 링크 ──────────────────────────────────────────────
+const reRegions = computed(() => [...new Set(reLinks.value.map(l => l.region).filter(Boolean))])
+const addLink = async () => {
+  if (!newLink.value.title.trim() || !newLink.value.url.trim()) return
+  const { data, error } = await supabase.from('realestate_links').insert({ ...newLink.value }).select().single()
+  if (!error && data) {
+    reLinks.value.unshift(data)
+    newLink.value = { region:'', title:'', url:'', memo:'' }
+    showAddLink.value = false
+  }
+}
+const deleteLink = async (id) => {
+  const { error } = await supabase.from('realestate_links').delete().eq('id', id)
+  if (!error) reLinks.value = reLinks.value.filter(l => l.id !== id)
 }
 
 // ── 체크리스트 ───────────────────────────────────────────────
@@ -492,6 +513,34 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
             </div>
           </template>
 
+          <!-- 부동산 탭 -->
+          <template v-else-if="tab==='realestate'">
+            <div class="check-header">
+              <p class="section-title" style="margin:0">관심 부동산</p>
+              <button @click="showAddLink=true" class="btn-check-add">+ 추가</button>
+            </div>
+
+            <div v-if="!reLinks.length" class="empty-state">
+              <div>🏠</div><p>관심 매물 링크를 저장해보세요</p>
+            </div>
+
+            <!-- 지역별 그룹 -->
+            <template v-else>
+              <div v-for="region in [...reRegions, '기타']" :key="region">
+                <div v-if="reLinks.filter(l => region==='기타' ? !l.region : l.region===region).length">
+                  <div class="re-region-label">📍 {{ region }}</div>
+                  <div v-for="l in reLinks.filter(l => region==='기타' ? !l.region : l.region===region)" :key="l.id" class="re-item">
+                    <a :href="l.url" target="_blank" class="re-link">
+                      <div class="re-title">{{ l.title }}</div>
+                      <div v-if="l.memo" class="re-memo">{{ l.memo }}</div>
+                    </a>
+                    <button @click="deleteLink(l.id)" class="btn-check-del">✕</button>
+                  </div>
+                </div>
+              </div>
+            </template>
+          </template>
+
           <!-- 체크리스트 탭 -->
           <template v-else>
             <div class="check-header">
@@ -529,7 +578,37 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
           <button class="nav-btn" :class="{ active: tab==='checklist' }" @click="tab='checklist'">
             <span class="nav-icon">✅</span><span class="nav-label">체크리스트</span>
           </button>
+          <button class="nav-btn" :class="{ active: tab==='realestate' }" @click="tab='realestate'">
+            <span class="nav-icon">🏠</span><span class="nav-label">부동산</span>
+          </button>
         </nav>
+
+        <!-- 링크 추가 모달 -->
+        <div v-if="showAddLink" class="modal-overlay" @click.self="showAddLink=false">
+          <div class="modal">
+            <div class="modal-handle"></div>
+            <h3>매물 링크 추가</h3>
+            <div class="form-group"><label>지역</label>
+              <input v-model="newLink.region" class="modal-input" placeholder="예: 마포구, 서대문구" list="region-list" />
+              <datalist id="region-list">
+                <option v-for="r in reRegions" :key="r" :value="r" />
+              </datalist>
+            </div>
+            <div class="form-group"><label>제목 *</label>
+              <input v-model="newLink.title" class="modal-input" placeholder="예: 아현동 ○○아파트 84㎡" />
+            </div>
+            <div class="form-group"><label>링크 *</label>
+              <input v-model="newLink.url" class="modal-input" placeholder="https://..." />
+            </div>
+            <div class="form-group"><label>메모</label>
+              <input v-model="newLink.memo" class="modal-input" placeholder="보증금 3억, 월세 90 등" />
+            </div>
+            <div class="modal-actions">
+              <button class="btn-cancel" @click="showAddLink=false">취소</button>
+              <button class="btn-confirm" @click="addLink" :disabled="!newLink.title.trim()||!newLink.url.trim()">저장</button>
+            </div>
+          </div>
+        </div>
 
         <!-- ── 카테고리 관리 모달 ── -->
         <div v-if="showCatMgr" class="modal-overlay" @click.self="showCatMgr=false">
@@ -838,4 +917,22 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
 .loading-screen { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; color: #aaa; gap: 16px; }
 .spinner { width: 36px; height: 36px; border: 3px solid #ffd6d6; border-top-color: #ff6b6b; border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* 부동산 탭 */
+.re-region-label { font-size: 12px; font-weight: 700; color: #ff6b6b; letter-spacing: 0.5px; text-transform: uppercase; padding: 4px 0 8px; margin-top: 8px; }
+.re-item { background: white; border-radius: 14px; margin-bottom: 8px; overflow: hidden; box-shadow: 0 1px 4px rgba(0,0,0,0.05); display: flex; align-items: stretch; }
+.re-link { flex: 1; text-decoration: none; color: inherit; padding: 14px 16px; display: block; }
+.re-title { font-size: 15px; font-weight: 700; color: #333; margin-bottom: 4px; }
+.re-memo { font-size: 12px; color: #aaa; }
+.re-del { background: none; border: none; color: #ddd; font-size: 16px; cursor: pointer; padding: 0 14px; flex-shrink: 0; }
+.re-del:active { color: #ff4757; }
+
+/* 모달 폼 */
+.form-group { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+.form-group label { font-size: 12px; font-weight: 700; color: #aaa; letter-spacing: 0.3px; }
+.modal-input { width: 100%; padding: 12px; border: 1px solid #eee; border-radius: 12px; font-size: 15px; background: #fafafa; }
+.modal-input:focus { outline: none; border-color: #ff6b6b; background: white; }
+.modal-actions { display: flex; gap: 10px; margin-top: 8px; }
+.btn-confirm { flex: 1; padding: 14px; border: none; border-radius: 12px; cursor: pointer; background: #ff6b6b; font-size: 15px; font-weight: 700; color: white; }
+.btn-confirm:disabled { opacity: 0.4; }
 </style>
