@@ -12,7 +12,10 @@ const PRESET_ICONS  = ['💍','🛋️','💎','✈️','📦','👗','🍽️',
 
 // ── 인증 ────────────────────────────────────────────────────
 const isAuthorized = ref(false)
+const inputEmail    = ref('')
 const inputPassword = ref('')
+const loginError    = ref('')
+const currentUserId = ref('')
 const EDGE_FUNCTION_URL = 'https://wqahhqssawaxynqigwtr.supabase.co/functions/v1/smooth-action'
 
 // ── 데이터 ──────────────────────────────────────────────────
@@ -22,6 +25,7 @@ const checklist  = ref([])
 const budget     = ref(30000000)
 const reLinks    = ref([])
 const showAddLink = ref(false)
+const showAddCheck = ref(false)
 const newLink    = ref({ region:'', title:'', url:'', memo:'' })
 const catBudgets = ref({})
 
@@ -51,19 +55,29 @@ const setToast = (s) => {
 
 // ── 로그인 ──────────────────────────────────────────────────
 const login = async () => {
-  try {
-    const res = await fetch(EDGE_FUNCTION_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_KEY}`
-      },
-      body: JSON.stringify({ password: inputPassword.value, app: 'wedding' })
-    })
-    const { ok } = await res.json()
-    if (ok) { isAuthorized.value = true; await fetchAll() }
-    else { alert('비밀번호가 틀렸습니다!'); inputPassword.value = '' }
-  } catch { alert('인증 서버 오류, 다시 시도해주세요.') }
+  loginError.value = ''
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: inputEmail.value.trim(),
+    password: inputPassword.value
+  })
+  if (error) { loginError.value = '아이디 또는 비밀번호가 틀렸습니다.'; return }
+  currentUserId.value = data.user.id
+  isAuthorized.value = true
+  await fetchAll()
+}
+
+const logout = async () => {
+  await supabase.auth.signOut()
+  isAuthorized.value = false
+  currentUserId.value = ''
+  inputEmail.value = ''
+  inputPassword.value = ''
+  categories.value = []
+  items.value = []
+  checklist.value = []
+  reLinks.value = []
+  budget.value = 30000000
+  catBudgets.value = {}
 }
 
 // ── 전체 데이터 불러오기 ─────────────────────────────────────
@@ -79,7 +93,7 @@ const fetchAll = async () => {
 
     const [{ data: itemsData, error: e1 }, { data: settingsData, error: e2 }, { data: checkData }, { data: reData }] = await Promise.all([
       supabase.from('wedding_items').select('*').order('created_at'),
-      supabase.from('wedding_settings').select('*'),
+      supabase.from('wedding_settings').select('*').eq('user_id', currentUserId.value),
       supabase.from('wedding_checklist').select('*').order('created_at'),
       supabase.from('realestate_links').select('*').order('created_at', { ascending: false })
     ])
@@ -104,9 +118,10 @@ const fetchAll = async () => {
 const saveSettings = async () => {
   setToast('saving')
   try {
+    const uid = currentUserId.value
     const [{ error: e1 }, { error: e2 }] = await Promise.all([
-      supabase.from('wedding_settings').upsert({ key: 'budget',     value: budget.value },     { onConflict: 'key' }),
-      supabase.from('wedding_settings').upsert({ key: 'catBudgets', value: catBudgets.value }, { onConflict: 'key' })
+      supabase.from('wedding_settings').upsert({ key: 'budget',     value: budget.value,     user_id: uid }, { onConflict: 'key,user_id' }),
+      supabase.from('wedding_settings').upsert({ key: 'catBudgets', value: catBudgets.value, user_id: uid }, { onConflict: 'key,user_id' })
     ])
     if (e1) throw e1
     if (e2) throw e2
@@ -118,7 +133,7 @@ const saveSettings = async () => {
 const addCategory = async () => {
   if (!newCat.value.name.trim()) return
   setToast('saving')
-  const payload = { name: newCat.value.name.trim(), color: newCat.value.color, icon: newCat.value.icon, sort_order: categories.value.length }
+  const payload = { name: newCat.value.name.trim(), color: newCat.value.color, icon: newCat.value.icon, sort_order: categories.value.length, user_id: currentUserId.value }
   const { data, error } = await supabase.from('wedding_categories').insert(payload).select().single()
   if (!error && data) {
     categories.value.push(data)
@@ -183,7 +198,7 @@ const addItem = async () => {
     date:     newItem.value.date || null,
     category: view.value === 'detail' ? currentCat.value : newItem.value.category
   }
-  const { data, error } = await supabase.from('wedding_items').insert(payload).select().single()
+  const { data, error } = await supabase.from('wedding_items').insert({ ...payload, user_id: currentUserId.value }).select().single()
   if (!error && data) {
     items.value.push(data)
     newItem.value = { name:'', planned:'', actual:'', paid:false, memo:'', date:'', vendor:'', category: newItem.value.category }
@@ -225,7 +240,7 @@ const togglePaid = async (item) => {
 const reRegions = computed(() => [...new Set(reLinks.value.map(l => l.region).filter(Boolean))])
 const addLink = async () => {
   if (!newLink.value.title.trim() || !newLink.value.url.trim()) return
-  const { data, error } = await supabase.from('realestate_links').insert({ ...newLink.value }).select().single()
+  const { data, error } = await supabase.from('realestate_links').insert({ ...newLink.value, user_id: currentUserId.value }).select().single()
   if (!error && data) {
     reLinks.value.unshift(data)
     newLink.value = { region:'', title:'', url:'', memo:'' }
@@ -238,14 +253,29 @@ const deleteLink = async (id) => {
 }
 
 // ── 체크리스트 ───────────────────────────────────────────────
-const CHECK_PERIODS = ['연', '월', '주', '일']
-const checkPeriod = ref('일')
-const newCheckPeriod = ref('일')
-const filteredChecklist = computed(() => checklist.value.filter(c => c.period === checkPeriod.value))
+const CHECK_PERIODS = [
+  '1년~1년반 전', '10개월~12개월 전', '7개월~10개월 전',
+  '5개월~7개월 전', '4개월~5개월 전', '2개월~3개월 전',
+  '1개월 전', '2주 전', '3일~1일 전', '웨딩홀 계약 시 체크사항'
+]
+const newCheckPeriod = ref('1년~1년반 전')
+const collapsedPeriods = ref([])
+const togglePeriodCollapse = (p) => {
+  const idx = collapsedPeriods.value.indexOf(p)
+  if (idx >= 0) collapsedPeriods.value.splice(idx, 1)
+  else collapsedPeriods.value.push(p)
+}
+const checklistByPeriod = computed(() =>
+  CHECK_PERIODS.map(p => ({
+    period: p,
+    items: checklist.value.filter(c => c.period === p),
+    doneCount: checklist.value.filter(c => c.period === p && c.done).length
+  })).filter(g => g.items.length > 0)
+)
 const addCheck = async () => {
   if (!newCheckText.value.trim()) return
-  const { data, error } = await supabase.from('wedding_checklist').insert({ text: newCheckText.value.trim(), done: false, period: newCheckPeriod.value }).select().single()
-  if (!error && data) { checklist.value.push(data); newCheckText.value = '' }
+  const { data, error } = await supabase.from('wedding_checklist').insert({ text: newCheckText.value.trim(), done: false, period: newCheckPeriod.value, user_id: currentUserId.value }).select().single()
+  if (!error && data) { checklist.value.push(data); newCheckText.value = ''; showAddCheck.value = false }
   else alert('추가 실패: ' + error?.message)
 }
 const toggleCheck = async (item) => {
@@ -292,7 +322,7 @@ const overBudget   = computed(() => balance.value < 0)
 const totalProgress= computed(() => budget.value ? Math.min(totalActual.value/budget.value*100,100) : 0)
 const catProgress  = (name) => { const b=catBudgets.value[name]; return b ? Math.min(catActual(name)/b*100,100) : 0 }
 const catOver      = (name) => catBudgets.value[name]>0 && catActual(name)>catBudgets.value[name]
-const checkDoneCount = computed(() => filteredChecklist.value.filter(c=>c.done).length)
+const checkDoneCount = computed(() => checklist.value.filter(c=>c.done).length)
 
 const pieData = computed(() => {
   const total = totalActual.value; if (!total) return []
@@ -324,8 +354,10 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
       <div class="login-box">
         <div class="login-icon">💍</div>
         <h2>우리만의 결혼 준비</h2>
-        <input v-model="inputPassword" type="password" maxlength="15" placeholder="비밀번호 입력" @keyup.enter="login" class="pw-input" />
-        <button @click="login" class="btn-primary">입장하기</button>
+        <input v-model="inputEmail" type="text" placeholder="아이디" @keyup.enter="login" class="pw-input" style="margin-bottom:10px" />
+        <input v-model="inputPassword" type="password" placeholder="비밀번호" @keyup.enter="login" class="pw-input" />
+        <div v-if="loginError" style="color:#ef4444;font-size:13px;margin-top:8px">{{ loginError }}</div>
+        <button @click="login" class="btn-primary" style="margin-top:16px">입장하기</button>
       </div>
     </div>
 
@@ -343,7 +375,10 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
               <template v-if="tab==='home' && view==='detail'">{{ currentCat }}</template>
               <template v-else>💍 결혼 준비</template>
             </h1>
-            <button v-if="tab==='home' && view==='home'" class="icon-btn" @click="showSettings=!showSettings" :class="{ active: showSettings }">⚙️</button>
+            <div style="display:flex;gap:6px" v-if="tab==='home' && view==='home'">
+              <button class="icon-btn" @click="showSettings=!showSettings" :class="{ active: showSettings }">⚙️</button>
+              <button class="icon-btn" @click="logout" title="로그아웃">🚪</button>
+            </div>
             <div v-else class="header-spacer"></div>
           </div>
         </header>
@@ -548,30 +583,29 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
           <!-- 체크리스트 탭 -->
           <template v-else>
             <div class="check-header">
-              <p class="section-title" style="margin:0">할 일 목록</p>
-              <span class="check-count">{{ checkDoneCount }}/{{ filteredChecklist.length }} 완료</span>
-            </div>
-            <!-- 기간 탭 -->
-            <div class="period-tabs">
-              <button v-for="p in CHECK_PERIODS" :key="p"
-                class="period-tab" :class="{ active: checkPeriod===p }"
-                @click="checkPeriod=p">{{ p }}</button>
-            </div>
-            <div class="check-add-row">
-              <input v-model="newCheckText" placeholder="할 일 추가..." class="check-input" @keyup.enter="addCheck" />
-              <select v-model="newCheckPeriod" class="period-select">
-                <option v-for="p in CHECK_PERIODS" :key="p" :value="p">{{ p }}</option>
-              </select>
-              <button @click="addCheck" class="btn-check-add">추가</button>
+              <p class="section-title" style="margin:0">체크리스트</p>
+              <div style="display:flex;align-items:center;gap:10px">
+                <span class="check-count">{{ checkDoneCount }}/{{ checklist.length }} 완료</span>
+                <button @click="showAddCheck=true" class="btn-check-add" style="padding:6px 14px;font-size:13px">+ 추가</button>
+              </div>
             </div>
             <div class="check-list">
-              <div v-for="item in filteredChecklist" :key="item.id" class="check-item" :class="{ done: item.done }">
-                <input type="checkbox" :checked="item.done" @change="toggleCheck(item)" class="check-checkbox" />
-                <span class="check-text" :class="{ strikethrough: item.done }">{{ item.text }}</span>
-                <button @click="deleteCheck(item.id)" class="btn-check-del">✕</button>
+              <div v-if="checklistByPeriod.length===0" class="empty-state">
+                <div>✅</div><p>항목을 추가해보세요!</p>
               </div>
-              <div v-if="filteredChecklist.length===0" class="empty-state">
-                <div>✅</div><p>할 일을 추가해보세요!</p>
+              <div v-for="group in checklistByPeriod" :key="group.period" class="check-period-group">
+                <div class="check-period-header" @click="togglePeriodCollapse(group.period)">
+                  <span class="check-period-label">{{ group.period }}</span>
+                  <span class="check-period-count">{{ group.doneCount }}/{{ group.items.length }}</span>
+                  <span class="check-period-toggle">{{ collapsedPeriods.includes(group.period) ? '▶' : '▼' }}</span>
+                </div>
+                <div v-if="!collapsedPeriods.includes(group.period)">
+                  <div v-for="item in group.items" :key="item.id" class="check-item" :class="{ done: item.done }">
+                    <input type="checkbox" :checked="item.done" @change="toggleCheck(item)" class="check-checkbox" />
+                    <span class="check-text" :class="{ strikethrough: item.done }">{{ item.text }}</span>
+                    <button @click="deleteCheck(item.id)" class="btn-check-del">✕</button>
+                  </div>
+                </div>
               </div>
             </div>
           </template>
@@ -595,6 +629,28 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
             <span class="nav-icon">🏠</span><span class="nav-label">부동산</span>
           </button>
         </nav>
+
+        <!-- 체크리스트 추가 모달 -->
+        <div v-if="showAddCheck" class="modal-overlay" @click.self="showAddCheck=false">
+          <div class="modal">
+            <div class="modal-handle"></div>
+            <h3>할 일 추가</h3>
+            <div class="form-group">
+              <label>기간</label>
+              <select v-model="newCheckPeriod" class="modal-input">
+                <option v-for="p in CHECK_PERIODS" :key="p" :value="p">{{ p }}</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>내용</label>
+              <input v-model="newCheckText" class="modal-input" placeholder="할 일 입력..." @keyup.enter="addCheck" />
+            </div>
+            <div class="modal-actions">
+              <button class="btn-cancel" @click="showAddCheck=false">취소</button>
+              <button class="btn-confirm" @click="addCheck" :disabled="!newCheckText.trim()">추가</button>
+            </div>
+          </div>
+        </div>
 
         <!-- 링크 추가 모달 -->
         <div v-if="showAddLink" class="modal-overlay" @click.self="showAddLink=false">
@@ -871,9 +927,11 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
 .item-memo { font-size: 13px; color: #666; margin-top: 6px; padding: 8px 10px; background: #fafafa; border-radius: 8px; }
 
 /* 체크리스트 */
-.period-tabs { display: flex; gap: 6px; margin-bottom: 12px; }
-.period-tab { flex: 1; padding: 8px; border: 1.5px solid #eee; border-radius: 10px; background: white; font-size: 14px; font-weight: 600; color: #bbb; cursor: pointer; }
-.period-tab.active { border-color: #ff6b6b; color: #ff6b6b; background: #fff3f3; }
+.check-period-group { margin-bottom: 8px; }
+.check-period-header { display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: #fff3f3; border-radius: 12px; cursor: pointer; user-select: none; }
+.check-period-label { flex: 1; font-size: 13px; font-weight: 700; color: #ff6b6b; }
+.check-period-count { font-size: 12px; color: #ff6b6b; opacity: 0.8; }
+.check-period-toggle { font-size: 11px; color: #ff6b6b; }
 .period-select { padding: 0 8px; border: 1px solid #eee; border-radius: 12px; font-size: 14px; background: white; color: #555; height: 48px; }
 .check-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .check-count { font-size: 13px; color: #ff6b6b; font-weight: 700; }
