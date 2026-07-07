@@ -67,6 +67,7 @@ const login = async () => {
 }
 
 const logout = async () => {
+  if (!confirm('로그아웃 하시겠어요?')) return
   await supabase.auth.signOut()
   isAuthorized.value = false
   currentUserId.value = ''
@@ -81,8 +82,8 @@ const logout = async () => {
 }
 
 // ── 전체 데이터 불러오기 ─────────────────────────────────────
-const fetchAll = async () => {
-  loading.value = true
+const fetchAll = async (showLoading = true) => {
+  if (showLoading) loading.value = true
   try {
     // 카테고리 먼저 로드 (catBudgets 초기화에 필요)
     const { data: catData, error: ce } = await supabase.from('wedding_categories').select('*').order('sort_order')
@@ -297,8 +298,8 @@ onMounted(() => {
       else if (p.eventType==='UPDATE') { const i=items.value.findIndex(i=>i.id===p.new.id); if(i>=0) items.value[i]=p.new }
       else if (p.eventType==='DELETE') items.value=items.value.filter(i=>i.id!==p.old.id)
     })
-    .on('postgres_changes', { event:'*', schema:'public', table:'wedding_categories' }, () => fetchAll())
-    .on('postgres_changes', { event:'*', schema:'public', table:'wedding_settings'   }, () => fetchAll())
+    .on('postgres_changes', { event:'*', schema:'public', table:'wedding_categories' }, () => fetchAll(false))
+    .on('postgres_changes', { event:'*', schema:'public', table:'wedding_settings'   }, () => fetchAll(false))
     .on('postgres_changes', { event:'*', schema:'public', table:'wedding_checklist'  }, (p) => {
       if (p.eventType==='INSERT') { if (!checklist.value.find(c=>c.id===p.new.id)) checklist.value.push(p.new) }
       else if (p.eventType==='UPDATE') { const i=checklist.value.findIndex(c=>c.id===p.new.id); if(i>=0) checklist.value[i]=p.new }
