@@ -996,7 +996,7 @@ onUnmounted(() => {
         </div>
         <div class="f-row">
           <label class="f-lab">출발 공항<input v-model="tripForm.origin_code" class="f-in mono" maxlength="3" placeholder="ICN" /></label>
-          <label class="f-lab">도착 공항<input v-model="tripForm.dest_code" class="f-in mono" maxlength="3" placeholder="KIX" /></label>
+          <label class="f-lab">도착 공항<input v-model="tripForm.dest_code" class="f-in mono" maxlength="3" placeholder="도착 공항" /></label>
         </div>
         <div class="f-row">
           <label class="f-lab">가는 날<input v-model="tripForm.start_date" type="date" class="f-in" /></label>
@@ -1010,7 +1010,7 @@ onUnmounted(() => {
             </select>
           </label>
           <label v-if="tripForm.currency !== 'KRW'" class="f-lab">{{ fxUnit(tripForm.currency) }}{{ curOf(tripForm.currency).name }} = 몇 원
-            <input v-model="tripForm.fx_input" type="number" inputmode="decimal" class="f-in" placeholder="912" />
+            <input v-model="tripForm.fx_input" type="number" inputmode="decimal" class="f-in" placeholder="환율" />
           </label>
         </div>
         <div class="f-act">
@@ -1025,7 +1025,7 @@ onUnmounted(() => {
     <div v-if="itemForm" class="sheet-bg" @click.self="itemForm = null">
       <div class="sheet">
         <h3>{{ itemForm.id ? '일정 고치기' : '일정 추가' }}</h3>
-        <input v-model="itemForm.title" class="f-in" placeholder="일정 (예: 라피트 → 난바)" />
+        <input v-model="itemForm.title" class="f-in" placeholder="일정 (예: 공항 → 호텔)" />
         <div v-if="itemForm.place?.address" class="f-note">📍 {{ itemForm.place.address }}</div>
         <div class="f-row">
           <label class="f-lab">날짜
@@ -1090,7 +1090,7 @@ onUnmounted(() => {
     <div v-if="expForm" class="sheet-bg" @click.self="expForm = null">
       <div class="sheet">
         <h3>{{ expForm.id ? '지출 고치기' : '지출 추가' }}</h3>
-        <input v-model="expForm.title" class="f-in" placeholder="어디에 (예: 이치란 도톤보리)" />
+        <input v-model="expForm.title" class="f-in" placeholder="어디에 (예: 점심)" />
         <div class="f-row">
           <input v-model="expForm.amount" type="number" inputmode="decimal" class="f-in mono" placeholder="금액" />
           <select v-model="expForm.currency" class="f-in" style="max-width:120px">
