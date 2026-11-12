@@ -370,7 +370,7 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
 
       <template v-else>
         <!-- 여행 탭: 헤더·화면·버튼을 따로 갖는다 -->
-        <TravelTab v-if="tab==='travel'" :supabase="supabase" :user-id="currentUserId" @logout="logout" />
+        <TravelTab v-if="tab==='travel'" :supabase="supabase" :user-id="currentUserId" @logout="logout" @nav="t => tab = t" />
 
         <!-- 헤더 -->
         <header v-if="tab!=='travel'" class="app-header">

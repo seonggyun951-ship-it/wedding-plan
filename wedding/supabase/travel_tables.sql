@@ -91,3 +91,9 @@ create policy "user own trip_places"   on trip_places   for all using (auth.uid(
 create policy "user own trip_events"   on trip_events   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "user own trip_expenses" on trip_expenses for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 create policy "user own trip_packing"  on trip_packing  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- 2026-11-13: 장소·일정 합치기 + 구간 이동 방법 (직접 고르기)
+-- 이동 방법·시간은 '앞 일정에서 이 일정으로 오는 구간'을 이 행에 적는다.
+alter table trip_events add column if not exists sort_order int;
+alter table trip_events add column if not exists move_mode  text;   -- walk / transit / taxi / car / etc
+alter table trip_events add column if not exists move_min   int;    -- 걸리는 시간(분)

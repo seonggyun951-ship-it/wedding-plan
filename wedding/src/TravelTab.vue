@@ -1,13 +1,17 @@
 <script setup>
-import { ref, computed, watch, nextTick, onMounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 
 // 여행 탭. 웨딩앱과 계정·Supabase를 같이 쓰고, 화면과 데이터는 따로 간다.
 // 테이블: trips / trip_events / trip_places / trip_expenses / trip_packing (supabase/travel_tables.sql)
+//
+// 장소와 일정은 한 화면이다. 일정 한 줄(trip_events)이 장소(trip_places)를 가리키고,
+// 일정에 안 들어간 장소는 '담아 둔 곳'으로 모인다. 순서는 sort_order, 앞 줄에서 오는
+// 구간의 이동 방법·시간은 그 줄의 move_mode / move_min 에 적는다.
 const props = defineProps({
   supabase: { type: Object, required: true },
   userId:   { type: String, required: true },
 })
-const emit = defineEmits(['logout'])
+const emit = defineEmits(['logout', 'nav'])
 const db = props.supabase
 
 // ── 상수 ────────────────────────────────────────────────────
@@ -16,6 +20,13 @@ const CATS = {
   stay: { label: '숙소', color: '#7a5af0' },
   food: { label: '맛집', color: '#e8890c' },
   spot: { label: '명소', color: '#0f7c8c' },
+}
+const MOVES = {
+  walk:    { label: '도보',     icon: '🚶', travel: 'walking' },
+  transit: { label: '대중교통', icon: '🚇', travel: 'transit' },
+  taxi:    { label: '택시',     icon: '🚕', travel: 'driving' },
+  car:     { label: '자동차',   icon: '🚗', travel: 'driving' },
+  etc:     { label: '기타',     icon: '➡️', travel: '' },
 }
 const EXP_CATS = ['숙소', '항공', '교통', '식비', '관광', '쇼핑', '기타']
 const EXP_COLORS = { 숙소:'#7a5af0', 항공:'#3b82c4', 교통:'#0f7c8c', 식비:'#e8890c', 관광:'#2f9e44', 쇼핑:'#d6336c', 기타:'#868e96' }
@@ -71,6 +82,19 @@ const ddayOf = (t) => {
 }
 const hhmm = (t) => (t ? t.slice(0, 5) : '')
 const fmt = (n) => Math.round(Number(n) || 0).toLocaleString()
+const minLabel = (m) => { m = Number(m) || 0; return m >= 60 ? `${Math.floor(m / 60)}시간${m % 60 ? ` ${m % 60}분` : ''}` : `${m}분` }
+
+// 브라우저 저장소는 막혀 있을 수 있다 (사생활 보호 모드 등). 실패해도 화면은 돌아가야 한다.
+const store = {
+  get: (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : v === '1' } catch { return d } },
+  set: (k, v) => { try { localStorage.setItem(k, v ? '1' : '0') } catch { /* 무시 */ } },
+}
+
+// ── 화면 폭: 넓으면 웹 모드 ─────────────────────────────────
+const WIDE_QUERY = '(min-width: 900px)'
+const isWide = ref(typeof window !== 'undefined' && window.matchMedia(WIDE_QUERY).matches)
+let wideMq = null
+const onWide = (e) => { isWide.value = e.matches }
 
 // ── 상태 ────────────────────────────────────────────────────
 const trips   = ref([])
@@ -78,17 +102,23 @@ const stats   = ref({})          // trip_id → { events, places, packDone, pack
 const loading = ref(true)
 const view    = ref('list')      // list | detail
 const tripId  = ref('')
-const sub     = ref('plan')      // plan | places | money | pack
+const sub     = ref('plan')      // plan | money | pack
 const dayYmd  = ref('')
 const places   = ref([])
 const events   = ref([])
 const expenses = ref([])
 const packing  = ref([])
-const selPlaceId = ref('')
+const selId = ref('')            // 지도에서 강조할 일정 id
 const busy = ref(false)
+const mapOpen    = ref(store.get('trv-map-open', false))   // 휴대폰: 지도 펼침
+const mapHidden  = ref(store.get('trv-map-hidden', false)) // 웹: 지도 숨김
+const mapAllDays = ref(false)
+watch(mapOpen,   (v) => store.set('trv-map-open', v))
+watch(mapHidden, (v) => store.set('trv-map-hidden', v))
 
 const trip = computed(() => trips.value.find(t => t.id === tripId.value) || null)
 const days = computed(() => tripDays(trip.value))
+const dayOf = (ymd) => days.value.find(d => d.ymd === ymd)
 const upcoming = computed(() => trips.value.filter(t => t.end_date >= todayYmd()).sort((a, b) => a.start_date.localeCompare(b.start_date)))
 const past     = computed(() => trips.value.filter(t => t.end_date <  todayYmd()).sort((a, b) => b.start_date.localeCompare(a.start_date)))
 const placeById = (id) => places.value.find(p => p.id === id) || null
@@ -124,7 +154,8 @@ async function openTrip(t) {
   sub.value = 'plan'
   const today = todayYmd()
   dayYmd.value = (today >= t.start_date && today <= t.end_date) ? today : t.start_date
-  selPlaceId.value = ''
+  selId.value = ''
+  mapAllDays.value = false
   places.value = []; events.value = []; expenses.value = []; packing.value = []
   view.value = 'detail'
   await loadDetail()
@@ -133,7 +164,7 @@ async function loadDetail() {
   const id = tripId.value
   const [p, e, x, k] = await Promise.all([
     db.from('trip_places').select('*').eq('trip_id', id).order('created_at'),
-    db.from('trip_events').select('*').eq('trip_id', id).order('day_date').order('start_time', { nullsFirst: false }),
+    db.from('trip_events').select('*').eq('trip_id', id).order('created_at'),
     db.from('trip_expenses').select('*').eq('trip_id', id).order('spent_on', { ascending: false }).order('created_at', { ascending: false }),
     db.from('trip_packing').select('*').eq('trip_id', id).order('created_at'),
   ])
@@ -143,21 +174,17 @@ async function loadDetail() {
 }
 function backToList() {
   view.value = 'list'
-  map = null; mapMarkers = []; mapLine = null
+  destroyMap()
   loadTrips()
 }
 
 // ── 여행 추가·수정·삭제 ─────────────────────────────────────
-const tripForm = ref(null)   // null이면 닫힘
+const tripForm = ref(null)
 const blankTrip = () => ({ id: null, title: '', emoji: '✈️', origin_code: 'ICN', dest_code: '', start_date: todayYmd(), end_date: todayYmd(), budget: '', currency: 'KRW', fx_input: '' })
 const fxUnit = (code) => curOf(code).per || 1
 function openTripForm(t) {
   if (!t) { tripForm.value = blankTrip(); return }
-  tripForm.value = {
-    ...t,
-    budget: t.budget || '',
-    fx_input: t.fx_rate ? +(Number(t.fx_rate) * fxUnit(t.currency)).toFixed(4) : '',
-  }
+  tripForm.value = { ...t, budget: t.budget || '', fx_input: t.fx_rate ? +(Number(t.fx_rate) * fxUnit(t.currency)).toFixed(4) : '' }
 }
 async function saveTrip() {
   const f = tripForm.value
@@ -182,7 +209,7 @@ async function saveTrip() {
   const i = trips.value.findIndex(t => t.id === res.data.id)
   if (i >= 0) trips.value[i] = res.data; else trips.value.push(res.data)
   tripForm.value = null
-  if (view.value === 'detail' && !days.value.find(d => d.ymd === dayYmd.value)) dayYmd.value = res.data.start_date
+  if (view.value === 'detail' && !dayOf(dayYmd.value)) dayYmd.value = res.data.start_date
 }
 async function deleteTrip() {
   const f = tripForm.value
@@ -194,130 +221,245 @@ async function deleteTrip() {
   backToList()
 }
 
-// ── 일정 ────────────────────────────────────────────────────
-const dayEvents = computed(() => {
-  const list = events.value.filter(e => e.day_date === dayYmd.value)
-    .slice().sort((a, b) => (a.start_time || '99').localeCompare(b.start_time || '99'))
-  // 앞 일정이 끝나기 전에 다음 일정이 시작하면 겹친다고 알린다
+// ── 일정 (장소 포함) ────────────────────────────────────────
+// 그날 일정 순서: sort_order → (없으면) 시간 → 만든 순서
+const byOrder = (a, b) =>
+  (a.sort_order ?? 1e9) - (b.sort_order ?? 1e9) ||
+  (a.start_time || '99').localeCompare(b.start_time || '99') ||
+  (a.created_at || '').localeCompare(b.created_at || '')
+const itemsOf = (ymd) => events.value.filter(e => e.day_date === ymd).slice().sort(byOrder)
+const dayItems = computed(() => {
+  const list = itemsOf(dayYmd.value)
+  let prevTimed = null
   return list.map((e, i) => {
-    const prev = list[i - 1]
-    const clash = prev && prev.end_time && e.start_time && e.start_time < prev.end_time
-    return { ...e, clash: clash ? `${hhmm(prev.start_time)} ${prev.title} 일정과 시간이 겹칩니다` : '' }
+    let warn = ''
+    if (prevTimed && e.start_time) {
+      if (e.start_time < prevTimed.start_time) warn = `앞 일정(${hhmm(prevTimed.start_time)})보다 이른 시간입니다`
+      else if (prevTimed.end_time && e.start_time < prevTimed.end_time) warn = `${hhmm(prevTimed.start_time)} ${prevTimed.title} 일정과 시간이 겹칩니다`
+    }
+    if (e.start_time) prevTimed = e
+    return { ...e, no: i + 1, warn, place: placeById(e.place_id), prev: i > 0 ? list[i - 1] : null }
   })
 })
-const eventForm = ref(null)
-function openEventForm(e, fromPlace) {
-  if (e) { eventForm.value = { ...e, start_time: hhmm(e.start_time), end_time: hhmm(e.end_time), place_id: e.place_id || '' }; return }
-  eventForm.value = {
-    id: null, day_date: dayYmd.value || days.value[0]?.ymd, start_time: '', end_time: '',
-    title: fromPlace?.name || '', category: fromPlace?.category || 'spot', place_id: fromPlace?.id || '', memo: '',
+const dayMoveTotal = computed(() => dayItems.value.reduce((s, e) => s + (e.prev && e.move_min ? Number(e.move_min) : 0), 0))
+const trayPlaces = computed(() => {
+  const used = events.value.map(e => e.place_id).filter(Boolean)
+  return places.value.filter(p => !used.includes(p.id))
+})
+
+// 바뀐 순서를 저장한다. 한 번에 여러 행을 고치는 API가 없어 바뀐 행만 하나씩 보낸다.
+async function saveOrder(list) {
+  const jobs = []
+  list.forEach((e, i) => {
+    const row = events.value.find(x => x.id === e.id)
+    if (row && row.sort_order !== i) {
+      row.sort_order = i
+      jobs.push(db.from('trip_events').update({ sort_order: i }).eq('id', e.id))
+    }
+  })
+  const res = await Promise.all(jobs)
+  const bad = res.find(r => r.error)
+  if (bad) fail('순서 저장', bad.error)
+}
+// 시간이 있는 새 일정은 시간에 맞는 자리에, 없으면 맨 끝에 넣는다
+function slotFor(list, startTime) {
+  if (!startTime) return list.length
+  const i = list.findIndex(e => e.start_time && hhmm(e.start_time) > startTime)
+  return i < 0 ? list.length : i
+}
+async function insertEvent(row, at) {
+  const list = itemsOf(row.day_date)
+  const pos = at ?? slotFor(list, row.start_time)
+  const res = await db.from('trip_events').insert({ ...row, sort_order: pos, trip_id: tripId.value, user_id: props.userId }).select().single()
+  if (res.error) { fail('일정 저장', res.error); return null }
+  events.value.push(res.data)
+  list.splice(pos, 0, res.data)
+  await saveOrder(list)
+  return res.data
+}
+
+// 일정 추가·수정 창
+const itemForm = ref(null)
+function openItemForm(e) {
+  if (e) {
+    const p = placeById(e.place_id)
+    itemForm.value = { ...e, start_time: hhmm(e.start_time), end_time: hhmm(e.end_time), place: p }
+  } else {
+    itemForm.value = { id: null, day_date: dayYmd.value || days.value[0]?.ymd, start_time: '', end_time: '', title: '', category: 'spot', memo: '', place: null }
   }
 }
-function onEventPlace() {
-  const p = placeById(eventForm.value.place_id)
-  if (p) { if (!eventForm.value.title) eventForm.value.title = p.name; eventForm.value.category = p.category }
-}
-async function saveEvent() {
-  const f = eventForm.value
+async function saveItem() {
+  const f = itemForm.value
   if (!f.title.trim()) return alert('일정 이름을 적어 주세요')
   if (f.start_time && f.end_time && f.end_time < f.start_time) return alert('끝나는 시각이 시작보다 빠릅니다')
-  const row = {
-    day_date: f.day_date, start_time: f.start_time || null, end_time: f.end_time || null,
-    title: f.title.trim(), category: f.category, place_id: f.place_id || null, memo: f.memo?.trim() || null,
-  }
+  const row = { day_date: f.day_date, start_time: f.start_time || null, end_time: f.end_time || null, title: f.title.trim(), category: f.category, memo: f.memo?.trim() || null }
   busy.value = true
-  const res = f.id
-    ? await db.from('trip_events').update(row).eq('id', f.id).select().single()
-    : await db.from('trip_events').insert({ ...row, trip_id: tripId.value, user_id: props.userId }).select().single()
-  busy.value = false
-  if (res.error) return fail('일정 저장', res.error)
-  const i = events.value.findIndex(x => x.id === res.data.id)
-  if (i >= 0) events.value[i] = res.data; else events.value.push(res.data)
-  eventForm.value = null
-  dayYmd.value = res.data.day_date
-  if (sub.value !== 'plan') sub.value = 'plan'
+  try {
+    if (!f.id) {
+      const made = await insertEvent(row)
+      if (made) { dayYmd.value = made.day_date; selId.value = made.id }
+    } else {
+      const old = events.value.find(x => x.id === f.id)
+      const movedDay = old.day_date !== row.day_date
+      const res = await db.from('trip_events').update(movedDay ? { ...row, move_mode: null, move_min: null } : row).eq('id', f.id).select().single()
+      if (res.error) return fail('일정 저장', res.error)
+      Object.assign(old, res.data)
+      if (f.place && f.category !== f.place.category) {
+        await db.from('trip_places').update({ category: f.category }).eq('id', f.place.id)
+        f.place.category = f.category
+      }
+      if (movedDay) {
+        // 다른 날로 옮기면 그날 끝(또는 시간 자리)으로 보내고 두 날 순서를 다시 매긴다
+        const target = itemsOf(row.day_date).filter(x => x.id !== old.id)
+        target.splice(slotFor(target, row.start_time), 0, old)
+        await saveOrder(target)
+        await saveOrder(itemsOf(old.day_date === row.day_date ? row.day_date : dayYmd.value))
+        dayYmd.value = row.day_date
+      }
+    }
+    itemForm.value = null
+  } finally { busy.value = false }
 }
-async function deleteEvent() {
-  const f = eventForm.value
-  if (!confirm(`'${f.title}' 일정을 삭제할까요?`)) return
+// 일정에서 빼서 '담아 둔 곳'으로 (장소는 남김)
+async function itemToTray() {
+  const f = itemForm.value
+  const day = events.value.find(x => x.id === f.id)?.day_date
+  const { error } = await db.from('trip_events').delete().eq('id', f.id)
+  if (error) return fail('일정에서 빼기', error)
+  events.value = events.value.filter(x => x.id !== f.id)
+  await saveOrder(itemsOf(day))
+  itemForm.value = null
+}
+async function deleteItem() {
+  const f = itemForm.value
+  if (!confirm(`'${f.title}' 일정을 삭제할까요?${f.place ? '\n담아 둔 장소 정보도 함께 지워집니다.' : ''}`)) return
+  const day = events.value.find(x => x.id === f.id)?.day_date
   const { error } = await db.from('trip_events').delete().eq('id', f.id)
   if (error) return fail('일정 삭제', error)
   events.value = events.value.filter(x => x.id !== f.id)
-  eventForm.value = null
-}
-const dirUrl = (p) => {
-  if (!p) return ''
-  if (p.lat != null && p.lng != null) return `https://www.google.com/maps/dir/?api=1&destination=${p.lat},${p.lng}`
-  return p.map_url || ''
+  if (f.place && !events.value.some(x => x.place_id === f.place.id)) {
+    const r = await db.from('trip_places').delete().eq('id', f.place.id)
+    if (r.error) fail('장소 삭제', r.error)
+    else places.value = places.value.filter(p => p.id !== f.place.id)
+  }
+  await saveOrder(itemsOf(day))
+  itemForm.value = null
 }
 
-// ── 장소 ────────────────────────────────────────────────────
-const assignedIds = computed(() => events.value.map(e => e.place_id).filter(Boolean))
-const placeDays = (id) => {
-  const ns = [...new Set(events.value.filter(e => e.place_id === id).map(e => days.value.find(d => d.ymd === e.day_date)?.n).filter(Boolean))].sort((a, b) => a - b)
-  if (!ns.length) return ''
-  return ns.length > 2 && ns[ns.length - 1] - ns[0] === ns.length - 1 ? `Day ${ns[0]}–${ns[ns.length - 1]}` : ns.map(n => `Day ${n}`).join(', ')
+// 담아 둔 곳 → 그날 일정 끝으로
+async function trayToDay(p, at) {
+  const made = await insertEvent({ day_date: dayYmd.value, title: p.name, category: p.category, place_id: p.id }, at)
+  if (made) selId.value = made.id
 }
-const freePlaces  = computed(() => places.value.filter(p => !assignedIds.value.includes(p.id)))
-const usedPlaces  = computed(() => places.value.filter(p =>  assignedIds.value.includes(p.id)))
-const placeNo = (id) => places.value.findIndex(p => p.id === id) + 1
-
 const placeForm = ref(null)
-function openPlaceForm(p) {
-  placeForm.value = p
-    ? { ...p }
-    : { id: null, name: '', category: 'spot', address: '', lat: null, lng: null, place_id: null, map_url: '', memo: '' }
-  query.value = ''; suggestions.value = []
-}
-// 구글 지도 링크에서 좌표를 꺼낸다. 짧은 공유 링크(maps.app.goo.gl)는 좌표가 안 들어 있어 못 꺼낸다.
-function coordsFromUrl(url) {
-  const pats = [/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/, /@(-?\d+\.\d+),(-?\d+\.\d+)/, /[?&](?:q|query|destination|ll)=(-?\d+\.\d+),\s*(-?\d+\.\d+)/]
-  for (const re of pats) { const m = (url || '').match(re); if (m) return { lat: Number(m[1]), lng: Number(m[2]) } }
-  return null
-}
-function onPlaceUrl() {
-  const c = coordsFromUrl(placeForm.value.map_url)
-  if (c) { placeForm.value.lat = c.lat; placeForm.value.lng = c.lng }
-}
+const openPlaceForm = (p) => { placeForm.value = { ...p } }
 async function savePlace() {
   const f = placeForm.value
   if (!f.name.trim()) return alert('장소 이름을 적어 주세요')
-  const row = {
-    name: f.name.trim(), category: f.category, address: f.address || null,
-    lat: f.lat, lng: f.lng, place_id: f.place_id, map_url: f.map_url?.trim() || null, memo: f.memo?.trim() || null,
-  }
-  busy.value = true
-  const res = f.id
-    ? await db.from('trip_places').update(row).eq('id', f.id).select().single()
-    : await db.from('trip_places').insert({ ...row, trip_id: tripId.value, user_id: props.userId }).select().single()
-  busy.value = false
+  const res = await db.from('trip_places').update({ name: f.name.trim(), category: f.category, memo: f.memo?.trim() || null }).eq('id', f.id).select().single()
   if (res.error) return fail('장소 저장', res.error)
-  const i = places.value.findIndex(x => x.id === res.data.id)
-  if (i >= 0) places.value[i] = res.data; else places.value.push(res.data)
+  const i = places.value.findIndex(x => x.id === f.id); if (i >= 0) places.value[i] = res.data
   placeForm.value = null
-  selPlaceId.value = res.data.id
 }
 async function deletePlace() {
   const f = placeForm.value
-  const n = events.value.filter(e => e.place_id === f.id).length
-  if (!confirm(`'${f.name}' 장소를 삭제할까요?${n ? `\n일정 ${n}개는 남고 장소 연결만 풀립니다.` : ''}`)) return
+  if (!confirm(`'${f.name}' 장소를 삭제할까요?`)) return
   const { error } = await db.from('trip_places').delete().eq('id', f.id)
   if (error) return fail('장소 삭제', error)
   places.value = places.value.filter(x => x.id !== f.id)
-  events.value = events.value.map(e => e.place_id === f.id ? { ...e, place_id: null } : e)
   placeForm.value = null
+}
+
+// ── 구간 이동 방법 (직접 고르기) ────────────────────────────
+const legForm = ref(null)
+function openLegForm(e) { legForm.value = { id: e.id, from: e.prev.title, to: e.title, mode: e.move_mode || 'walk', min: e.move_min || '' } }
+async function saveLeg(clear) {
+  const f = legForm.value
+  const row = clear ? { move_mode: null, move_min: null } : { move_mode: f.mode, move_min: Number(f.min) || null }
+  const { error } = await db.from('trip_events').update(row).eq('id', f.id)
+  if (error) return fail('이동 방법 저장', error)
+  Object.assign(events.value.find(x => x.id === f.id), row)
+  legForm.value = null
+}
+const ptOf = (e) => {
+  const p = placeById(e.place_id)
+  if (p && p.lat != null) return `${p.lat},${p.lng}`
+  return encodeURIComponent(p?.address || p?.name || e.title)
+}
+// 구글 지도 앱/웹에서 그 구간 길찾기를 연다 (URL만 쓰므로 무료)
+function legUrl(e) {
+  const tm = MOVES[e.move_mode]?.travel
+  return `https://www.google.com/maps/dir/?api=1&origin=${ptOf(e.prev)}&destination=${ptOf(e)}${tm ? `&travelmode=${tm}` : ''}`
+}
+const dirUrl = (p) => {
+  if (!p) return ''
+  if (p.lat != null) return `https://www.google.com/maps/dir/?api=1&destination=${p.lat},${p.lng}`
+  return p.map_url || ''
+}
+
+// ── 끌어서 순서 바꾸기 (마우스·손가락 공통: pointer 이벤트) ──
+const listEl = ref(null)
+const drag = ref(null)   // { id, from, over, dy, startY, mids }
+function onGripDown(ev, e, index) {
+  ev.preventDefault()
+  const rows = [...listEl.value.querySelectorAll('[data-row]')]
+  const mids = rows.map(r => { const b = r.getBoundingClientRect(); return b.top + b.height / 2 })
+  drag.value = { id: e.id, from: index, over: index, dy: 0, startY: ev.clientY, mids }
+  window.addEventListener('pointermove', onDragMove)
+  window.addEventListener('pointerup', onDragEnd)
+  window.addEventListener('pointercancel', onDragEnd)
+}
+function onDragMove(ev) {
+  const d = drag.value; if (!d) return
+  d.dy = ev.clientY - d.startY
+  d.over = d.mids.filter((m, i) => i !== d.from && m < ev.clientY).length
+}
+async function onDragEnd() {
+  window.removeEventListener('pointermove', onDragMove)
+  window.removeEventListener('pointerup', onDragEnd)
+  window.removeEventListener('pointercancel', onDragEnd)
+  const d = drag.value; drag.value = null
+  if (!d || d.over === d.from) return
+  const list = itemsOf(dayYmd.value)
+  const [moved] = list.splice(d.from, 1)
+  list.splice(d.over, 0, moved)
+  // 순서가 바뀌면 앞뒤 구간이 달라지므로, 앞 일정이 바뀐 줄의 이동 방법은 비운다
+  const before = itemsOf(dayYmd.value).map(x => x.id)
+  await saveOrder(list)
+  const clears = []
+  list.forEach((x, i) => {
+    const prevNow = i > 0 ? list[i - 1].id : null
+    const prevThen = before.indexOf(x.id) > 0 ? before[before.indexOf(x.id) - 1] : null
+    if (prevNow !== prevThen && (x.move_mode || x.move_min)) {
+      x.move_mode = null; x.move_min = null
+      clears.push(db.from('trip_events').update({ move_mode: null, move_min: null }).eq('id', x.id))
+    }
+  })
+  await Promise.all(clears)
+}
+const rankOf = (i) => { const d = drag.value; return i < d.from ? i : i - 1 }
+// 웹: 담아 둔 곳을 끌어다 일정에 놓기 (HTML 끌어놓기)
+const dropOver = ref(false)
+function onTrayDragStart(ev, p) { ev.dataTransfer.setData('text/plain', p.id); ev.dataTransfer.effectAllowed = 'move' }
+async function onListDrop(ev) {
+  dropOver.value = false
+  const p = placeById(ev.dataTransfer.getData('text/plain'))
+  if (!p) return
+  const rows = [...listEl.value.querySelectorAll('[data-row]')]
+  const at = rows.filter(r => { const b = r.getBoundingClientRect(); return b.top + b.height / 2 < ev.clientY }).length
+  await trayToDay(p, at)
 }
 
 // ── 구글 지도 ───────────────────────────────────────────────
 // 키는 .env의 VITE_GOOGLE_MAPS_KEY. 없으면 지도 자리에 안내만 띄우고 나머지는 그대로 쓴다.
-// 지도는 여행 화면에 들어갈 때 한 번만 만들고(=1회 과금 단위), Day·탭을 바꿀 땐 핀만 다시 그린다.
+// 지도는 보일 때 한 번만 만들고(=과금 1회), Day를 바꾸거나 접었다 펴도 핀만 다시 그린다.
 const MAPS_KEY = import.meta.env.VITE_GOOGLE_MAPS_KEY || ''
 const mapEl = ref(null)
 const mapError = ref('')
 let mapsPromise = null
 let map = null
 let mapMarkers = []
-let mapLine = null
+let mapLines = []
 
 function loadMaps() {
   if (!MAPS_KEY) return Promise.resolve(null)
@@ -334,15 +476,16 @@ function loadMaps() {
   }
   return mapsPromise
 }
-// 키가 틀렸거나 API가 꺼져 있으면 구글이 이 함수를 부른다
+// 키가 틀렸거나 허용 안 된 주소면 구글이 이 함수를 부른다
 window.gm_authFailure = () => { mapError.value = '구글 지도 키를 확인해 주세요 (키 제한 또는 API 사용 설정)' }
 
+const mapVisible = computed(() => view.value === 'detail' && sub.value === 'plan' && (isWide.value ? !mapHidden.value : mapOpen.value))
 async function ensureMap() {
   if (map || !MAPS_KEY || !mapEl.value) return map
   try {
     const maps = await loadMaps()
     const { Map } = await maps.importLibrary('maps')
-    if (!mapEl.value) return null
+    if (!mapEl.value || map) return map
     map = new Map(mapEl.value, {
       center: { lat: 37.5665, lng: 126.978 }, zoom: 12,
       mapTypeControl: false, streetViewControl: false, fullscreenControl: false, clickableIcons: false,
@@ -354,49 +497,53 @@ async function ensureMap() {
 }
 function clearPins() {
   mapMarkers.forEach(m => m.setMap(null)); mapMarkers = []
-  if (mapLine) { mapLine.setMap(null); mapLine = null }
+  mapLines.forEach(l => l.setMap(null)); mapLines = []
 }
+function destroyMap() { clearPins(); map = null }
 async function drawPins() {
-  if (view.value !== 'detail' || !(sub.value === 'plan' || sub.value === 'places')) return
+  if (!mapVisible.value) return
   await nextTick()
   const m = await ensureMap()
   if (!m) return
   const g = window.google.maps
   clearPins()
-  let pts = []
-  if (sub.value === 'plan') {
-    pts = dayEvents.value.map(e => placeById(e.place_id)).filter(p => p && p.lat != null)
-      .map((p, i) => ({ p, label: String(i + 1) }))
-  } else {
-    pts = places.value.filter(p => p.lat != null).map(p => ({ p, label: String(placeNo(p.id)) }))
-  }
-  pts.forEach(({ p, label }) => {
-    const sel = sub.value === 'places' && p.id === selPlaceId.value
-    mapMarkers.push(new g.Marker({
-      map: m, position: { lat: p.lat, lng: p.lng }, title: p.name,
-      label: { text: label, color: '#fff', fontSize: '11px', fontWeight: '700' },
-      icon: { path: g.SymbolPath.CIRCLE, scale: sel ? 13 : 10, fillColor: CATS[p.category]?.color || '#16263d', fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2 },
-      zIndex: sel ? 10 : 1,
-    }))
+  const groups = mapAllDays.value
+    ? days.value.map(d => ({ d, items: itemsOf(d.ymd) }))
+    : [{ d: dayOf(dayYmd.value), items: itemsOf(dayYmd.value) }]
+  const all = []
+  groups.forEach(({ d, items }) => {
+    const pts = []
+    items.forEach((e, i) => {
+      const p = placeById(e.place_id)
+      if (!p || p.lat == null) return
+      const sel = e.id === selId.value
+      const label = mapAllDays.value ? `${d?.n}` : String(i + 1)
+      mapMarkers.push(new g.Marker({
+        map: m, position: { lat: p.lat, lng: p.lng }, title: `${label}. ${e.title}`,
+        label: { text: label, color: '#fff', fontSize: '11px', fontWeight: '700' },
+        icon: { path: g.SymbolPath.CIRCLE, scale: sel ? 13 : 10, fillColor: CATS[e.category]?.color || '#16263d', fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2 },
+        zIndex: sel ? 10 : 1,
+      }))
+      pts.push({ lat: p.lat, lng: p.lng })
+    })
+    if (pts.length > 1) mapLines.push(new g.Polyline({ map: m, path: pts, strokeColor: '#16263d', strokeOpacity: mapAllDays.value ? 0.35 : 0.55, strokeWeight: 3 }))
+    all.push(...pts)
   })
-  if (sub.value === 'plan' && pts.length > 1) {
-    mapLine = new g.Polyline({ map: m, path: pts.map(({ p }) => ({ lat: p.lat, lng: p.lng })), strokeColor: '#16263d', strokeOpacity: 0.55, strokeWeight: 3 })
-  }
-  const sel = sub.value === 'places' && placeById(selPlaceId.value)
-  if (sel && sel.lat != null) { m.panTo({ lat: sel.lat, lng: sel.lng }); m.setZoom(15); return }
-  if (pts.length === 1) { m.setCenter({ lat: pts[0].p.lat, lng: pts[0].p.lng }); m.setZoom(15) }
-  else if (pts.length > 1) { const b = new g.LatLngBounds(); pts.forEach(({ p }) => b.extend({ lat: p.lat, lng: p.lng })); m.fitBounds(b, 40) }
+  const selItem = events.value.find(e => e.id === selId.value)
+  const selP = selItem && placeById(selItem.place_id)
+  if (selP && selP.lat != null && !mapAllDays.value) { m.panTo({ lat: selP.lat, lng: selP.lng }); if (m.getZoom() < 14) m.setZoom(15); return }
+  if (all.length === 1) { m.setCenter(all[0]); m.setZoom(15) }
+  else if (all.length > 1) { const b = new g.LatLngBounds(); all.forEach(p => b.extend(p)); m.fitBounds(b, 40) }
 }
-const pinCount = computed(() => sub.value === 'plan'
-  ? dayEvents.value.filter(e => placeById(e.place_id)?.lat != null).length
-  : places.value.filter(p => p.lat != null).length)
-watch([view, sub, dayYmd, selPlaceId, places, events], drawPins, { deep: true })
+const pinCount = computed(() => dayItems.value.filter(e => e.place?.lat != null).length)
+watch([mapVisible, dayYmd, selId, mapAllDays, places, events, isWide], drawPins, { deep: true })
 
 // ── 장소 검색 (Places API New: 자동완성 → 고른 장소의 위치·주소만 받음) ──
-// 이름은 자동완성 결과에서 쓰고, 상세 조회는 위치·주소만 받아 가장 싼 등급으로 끝낸다.
+// 이름·종류는 자동완성 결과에서 쓰고, 상세 조회는 위치·주소만 받아 가장 싼 등급으로 끝낸다.
 const query = ref('')
 const suggestions = ref([])
 const searching = ref(false)
+const toTray = ref(false)       // 켜면 일정 대신 '담아 둔 곳'으로
 let sessionToken = null
 let searchTimer = null
 watch(query, (q) => {
@@ -418,6 +565,7 @@ async function searchPlaces(q) {
       pred: s.placePrediction,
       main: s.placePrediction.mainText?.text || s.placePrediction.text?.text || '',
       second: s.placePrediction.secondaryText?.text || '',
+      types: s.placePrediction.types || [],
     }))
   } catch (e) {
     mapError.value = `장소 검색 실패: ${e.message || e}`
@@ -426,23 +574,47 @@ async function searchPlaces(q) {
     searching.value = false
   }
 }
+function catFromTypes(types) {
+  const t = types.join(' ')
+  if (/lodging|hotel/.test(t)) return 'stay'
+  if (/airport|train_station|subway_station|transit_station|bus_station|ferry/.test(t)) return 'move'
+  if (/restaurant|cafe|food|bakery|bar|meal/.test(t)) return 'food'
+  return 'spot'
+}
+async function addPlace(row) {
+  const res = await db.from('trip_places').insert({ ...row, trip_id: tripId.value, user_id: props.userId }).select().single()
+  if (res.error) { fail('장소 저장', res.error); return null }
+  places.value.push(res.data)
+  return res.data
+}
 async function pickSuggestion(s) {
+  busy.value = true
   try {
     const place = s.pred.toPlace()
     await place.fetchFields({ fields: ['location', 'formattedAddress'] })
-    const f = placeForm.value
-    f.name = s.main
-    f.address = place.formattedAddress || s.second
-    f.lat = place.location?.lat() ?? null
-    f.lng = place.location?.lng() ?? null
-    f.place_id = place.id || s.pred.placeId
-    f.map_url = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(s.main)}&query_place_id=${f.place_id}`
+    const pid = place.id || s.pred.placeId
+    const p = await addPlace({
+      name: s.main, category: catFromTypes(s.types), address: place.formattedAddress || s.second,
+      lat: place.location?.lat() ?? null, lng: place.location?.lng() ?? null, place_id: pid,
+      map_url: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(s.main)}&query_place_id=${pid}`,
+    })
+    if (p && !toTray.value) await trayToDay(p)
   } catch (e) {
     alert(`장소 정보를 받지 못했습니다: ${e.message || e}`)
   } finally {
     sessionToken = null   // 한 장소를 고르면 검색 묶음(세션)을 끝낸다
     query.value = ''; suggestions.value = []
+    busy.value = false
   }
+}
+// 검색 결과를 고르지 않고 Enter: 이름만 있는 일정(또는 담아 두기)으로 넣는다
+async function quickAdd() {
+  const name = query.value.trim()
+  if (!name) return
+  if (suggestions.value.length) return pickSuggestion(suggestions.value[0])
+  query.value = ''
+  if (toTray.value) await addPlace({ name, category: 'spot' })
+  else { const made = await insertEvent({ day_date: dayYmd.value, title: name, category: 'spot' }); if (made) selId.value = made.id }
 }
 
 // ── 경비 ────────────────────────────────────────────────────
@@ -467,7 +639,7 @@ const expByDay = computed(() => {
 })
 const dayTitle = (ymd) => {
   if (!ymd) return '날짜 없음'
-  const d = days.value.find(d => d.ymd === ymd)
+  const d = dayOf(ymd)
   return d ? `DAY ${d.n} · ${mmdd(ymd)}` : mmdd(ymd)
 }
 const fxText = computed(() => {
@@ -478,7 +650,6 @@ const fxText = computed(() => {
   return `${per}${cur.value.name} = ${fmt(t.fx_rate * per)}원`
 })
 const amountText = (x) => x.currency === 'KRW' ? `${fmt(x.amount)}원` : `${curOf(x.currency).sym}${Number(x.amount).toLocaleString()}`
-
 const expForm = ref(null)
 function openExpForm(x) {
   if (x) { expForm.value = { ...x }; return }
@@ -496,13 +667,10 @@ async function saveExp() {
   if (!f.title.trim()) return alert('어디에 썼는지 적어 주세요')
   if (!Number(f.amount)) return alert('금액을 적어 주세요')
   if (f.currency !== 'KRW' && !trip.value.fx_rate) return alert('여행 설정(⚙️)에서 환율을 먼저 넣어 주세요')
-  // 수정할 때 금액·통화를 안 바꿨으면 처음 환산한 원화를 그대로 둔다 (환율을 바꿔도 지난 지출은 그대로)
+  // 금액·통화를 안 바꿨으면 처음 환산한 원화를 그대로 둔다 (환율을 바꿔도 지난 지출은 그대로)
   const orig = f.id && expenses.value.find(x => x.id === f.id)
   const sameMoney = orig && Number(orig.amount) === Number(f.amount) && orig.currency === f.currency
-  const row = {
-    title: f.title.trim(), amount: Number(f.amount), currency: f.currency, category: f.category,
-    spent_on: f.spent_on || null, amount_krw: sameMoney ? orig.amount_krw : Math.round(expKrwPreview.value),
-  }
+  const row = { title: f.title.trim(), amount: Number(f.amount), currency: f.currency, category: f.category, spent_on: f.spent_on || null, amount_krw: sameMoney ? orig.amount_krw : Math.round(expKrwPreview.value) }
   busy.value = true
   const res = f.id
     ? await db.from('trip_expenses').update(row).eq('id', f.id).select().single()
@@ -569,48 +737,61 @@ async function deletePack(x) {
   packing.value = packing.value.filter(p => p.id !== x.id)
 }
 
-// ── FAB ─────────────────────────────────────────────────────
+// ── + 버튼 ──────────────────────────────────────────────────
 function onFab() {
   if (view.value === 'list') return openTripForm(null)
-  if (sub.value === 'plan') return openEventForm(null)
-  if (sub.value === 'places') return openPlaceForm(null)
+  if (sub.value === 'plan') return openItemForm(null)
   if (sub.value === 'money') return openExpForm(null)
   return openPackForm()
 }
+const APP_TABS = [['home', '🏠 홈'], ['checklist', '✅ 체크리스트'], ['realestate', '🏠 부동산']]
 
-onMounted(loadTrips)
+onMounted(() => {
+  loadTrips()
+  wideMq = window.matchMedia(WIDE_QUERY)
+  wideMq.addEventListener('change', onWide)
+})
+onUnmounted(() => {
+  wideMq?.removeEventListener('change', onWide)
+  window.removeEventListener('pointermove', onDragMove)
+  window.removeEventListener('pointerup', onDragEnd)
+})
 </script>
 
 <template>
-  <div class="trv">
+  <div class="trv" :class="{ wide: isWide }">
     <!-- 헤더 -->
     <header class="trv-hdr">
       <template v-if="view === 'list'">
         <h1 class="trv-title">✈️ 여행</h1>
-        <button class="trv-ib" @click="emit('logout')" title="로그아웃">🚪</button>
       </template>
       <template v-else-if="trip">
-        <button class="trv-back" @click="backToList">←</button>
+        <button class="trv-back" @click="backToList" aria-label="여행 목록으로">←</button>
         <div class="trv-hgrow">
-          <h1 class="trv-title">{{ trip.title }}</h1>
+          <h1 class="trv-title">{{ trip.emoji }} {{ trip.title }}</h1>
           <div class="trv-route mono">
-            <template v-if="trip.origin_code && trip.dest_code">{{ trip.origin_code }} ✈ {{ trip.dest_code }} · </template>{{ mmdd(trip.start_date) }}–{{ mmdd(trip.end_date) }}
+            <template v-if="trip.origin_code && trip.dest_code">{{ trip.origin_code }} ✈ {{ trip.dest_code }} · </template>{{ mmdd(trip.start_date) }}–{{ mmdd(trip.end_date) }}<template v-if="isWide"> · {{ nightsLabel(trip) }}</template>
           </div>
         </div>
-        <button class="trv-ib" @click="openTripForm(trip)" title="여행 설정">⚙️</button>
       </template>
+      <nav v-if="isWide" class="trv-appnav">
+        <button v-for="[k, l] in APP_TABS" :key="k" @click="emit('nav', k)">{{ l }}</button>
+        <button class="on">✈️ 여행</button>
+      </nav>
+      <button v-if="view === 'detail' && trip" class="trv-ib" @click="openTripForm(trip)" title="여행 설정">⚙️</button>
+      <button v-else class="trv-ib" @click="emit('logout')" title="로그아웃">🚪</button>
     </header>
 
-    <div class="trv-body">
-      <!-- ① 여행 목록 -->
-      <template v-if="view === 'list'">
-        <div v-if="loading" class="trv-empty">불러오는 중...</div>
-        <div v-else-if="!trips.length" class="trv-empty">
-          <div style="font-size:34px">🧳</div>
-          <p>아직 여행이 없습니다<br>오른쪽 아래 + 로 첫 여행을 만들어 보세요</p>
-        </div>
-        <template v-else>
-          <p v-if="upcoming.length" class="trv-sec">UPCOMING</p>
+    <!-- ① 여행 목록 -->
+    <div v-if="view === 'list'" class="trv-body list-body">
+      <div v-if="loading" class="trv-empty">불러오는 중...</div>
+      <div v-else-if="!trips.length" class="trv-empty">
+        <div style="font-size:34px">🧳</div>
+        <p>아직 여행이 없습니다<br>+ 로 첫 여행을 만들어 보세요</p>
+      </div>
+      <template v-else>
+        <p v-if="upcoming.length" class="trv-sec">UPCOMING</p>
+        <div class="pass-grid">
           <div v-for="t in upcoming" :key="t.id" class="pass" @click="openTrip(t)">
             <div class="pass-main">
               <div v-if="t.origin_code && t.dest_code" class="codes mono"><b>{{ t.origin_code }}</b><span class="plane"></span><b>{{ t.dest_code }}</b></div>
@@ -620,7 +801,6 @@ onMounted(loadTrips)
               <div class="pass-mini">
                 <span v-if="t.budget">예산 <b class="mono">{{ Math.round(statOf(t.id).used / t.budget * 100) }}%</b></span>
                 <span>일정 <b>{{ statOf(t.id).events }}</b></span>
-                <span>장소 <b>{{ statOf(t.id).places }}</b></span>
                 <span v-if="statOf(t.id).packAll">준비물 <b>{{ statOf(t.id).packDone }}/{{ statOf(t.id).packAll }}</b></span>
               </div>
             </div>
@@ -629,7 +809,9 @@ onMounted(loadTrips)
               <span class="dd mono" :class="{ small: ddayOf(t).text === '여행 중' }">{{ ddayOf(t).text }}</span>
             </div>
           </div>
-          <p v-if="past.length" class="trv-sec" style="margin-top:16px">PAST</p>
+        </div>
+        <p v-if="past.length" class="trv-sec" style="margin-top:16px">PAST</p>
+        <div class="pass-grid">
           <div v-for="t in past" :key="t.id" class="pass past" @click="openTrip(t)">
             <div class="pass-main">
               <div v-if="t.origin_code && t.dest_code" class="codes mono small"><b>{{ t.origin_code }}</b><span class="plane"></span><b>{{ t.dest_code }}</b></div>
@@ -638,119 +820,171 @@ onMounted(loadTrips)
             </div>
             <div class="pass-stub"><span class="dd past mono">완료</span></div>
           </div>
-        </template>
-      </template>
-
-      <!-- 여행 상세 -->
-      <template v-else-if="trip">
-        <div class="tabs">
-          <button :class="{ on: sub === 'plan' }"   @click="sub = 'plan'">일정</button>
-          <button :class="{ on: sub === 'places' }" @click="sub = 'places'">장소</button>
-          <button :class="{ on: sub === 'money' }"  @click="sub = 'money'">경비</button>
-          <button :class="{ on: sub === 'pack' }"   @click="sub = 'pack'">준비물</button>
         </div>
-
-        <div v-if="sub === 'plan'" class="days">
-          <button v-for="d in days" :key="d.ymd" class="day" :class="{ on: d.ymd === dayYmd }" @click="dayYmd = d.ymd">
-            <b>Day {{ d.n }}</b>{{ d.label }}
-          </button>
-        </div>
-
-        <!-- 지도: 일정·장소 탭이 같이 쓴다. 탭을 바꿔도 지도를 새로 만들지 않도록 v-show -->
-        <div v-show="sub === 'plan' || sub === 'places'" class="map">
-          <div ref="mapEl" class="map-canvas"></div>
-          <div v-if="!MAPS_KEY" class="map-off">구글 지도 키를 넣으면 여기에 지도가 보입니다</div>
-          <div v-else-if="mapError" class="map-off">{{ mapError }}</div>
-          <span v-else-if="sub === 'plan'" class="map-tag">Day {{ days.find(d => d.ymd === dayYmd)?.n }} 동선 · 장소 {{ pinCount }}곳</span>
-        </div>
-
-        <!-- ② 일정 -->
-        <template v-if="sub === 'plan'">
-          <div v-if="!dayEvents.length" class="trv-empty small">이날 일정이 없습니다. + 로 추가하세요</div>
-          <div v-else class="tl">
-            <div v-for="e in dayEvents" :key="e.id" class="ev" :class="[e.category, { clash: e.clash }]" :style="{ '--c': CATS[e.category]?.color }" @click="openEventForm(e)">
-              <span class="ev-t mono">{{ hhmm(e.start_time) }}</span>
-              <div class="ev-title">
-                <span>{{ e.title }}</span>
-                <a v-if="dirUrl(placeById(e.place_id))" class="go" :href="dirUrl(placeById(e.place_id))" target="_blank" rel="noopener" @click.stop>길찾기 ↗</a>
-              </div>
-              <div v-if="e.end_time || e.memo" class="ev-sub">
-                <template v-if="e.end_time">~{{ hhmm(e.end_time) }}</template><template v-if="e.end_time && e.memo"> · </template>{{ e.memo }}
-              </div>
-              <div v-if="e.clash" class="warn">{{ e.clash }}</div>
-            </div>
-          </div>
-        </template>
-
-        <!-- ③ 장소 -->
-        <template v-else-if="sub === 'places'">
-          <div v-if="!places.length" class="trv-empty small">가고 싶은 곳을 + 로 담아 두세요</div>
-          <p v-if="freePlaces.length" class="trv-sec">아직 날짜 안 정한 곳</p>
-          <div v-for="p in freePlaces" :key="p.id" class="place" :class="{ sel: p.id === selPlaceId }" @click="selPlaceId = p.id">
-            <span class="pin" :style="{ background: CATS[p.category]?.color }"><span>{{ placeNo(p.id) }}</span></span>
-            <div class="place-txt"><div class="place-nm">{{ p.name }}</div><div class="place-src">{{ CATS[p.category]?.label }}<template v-if="p.lat == null"> · 위치 없음</template></div></div>
-            <button class="assign none" @click.stop="openEventForm(null, p)">Day 고르기</button>
-            <button class="mini-edit" @click.stop="openPlaceForm(p)">⋯</button>
-          </div>
-          <p v-if="usedPlaces.length" class="trv-sec" style="margin-top:12px">일정에 넣은 곳</p>
-          <div v-for="p in usedPlaces" :key="p.id" class="place" :class="{ sel: p.id === selPlaceId }" @click="selPlaceId = p.id">
-            <span class="pin" :style="{ background: CATS[p.category]?.color }"><span>{{ placeNo(p.id) }}</span></span>
-            <div class="place-txt"><div class="place-nm">{{ p.name }}</div><div class="place-src">{{ CATS[p.category]?.label }}<template v-if="p.lat == null"> · 위치 없음</template></div></div>
-            <span class="assign set">{{ placeDays(p.id) }}</span>
-            <button class="mini-edit" @click.stop="openPlaceForm(p)">⋯</button>
-          </div>
-        </template>
-
-        <!-- ④ 경비 -->
-        <template v-else-if="sub === 'money'">
-          <div class="wallet">
-            <div class="w-lbl">{{ trip.budget ? '남은 예산' : '쓴 돈' }}</div>
-            <div class="w-big mono" :class="{ over: trip.budget && budgetLeft < 0 }">₩{{ fmt(trip.budget ? budgetLeft : used) }}</div>
-            <template v-if="trip.budget">
-              <div class="gauge dark"><i :style="{ width: usedPct + '%' }"></i></div>
-              <div class="w-row mono"><span>예산 {{ fmt(trip.budget) }}</span><span>사용 {{ fmt(used) }}</span></div>
-            </template>
-          </div>
-          <div v-if="fxText" class="fx" @click="openTripForm(trip)">💱 <span class="mono">{{ fxText }}</span><span class="fx-sub">직접 입력</span><span class="fx-edit">바꾸기</span></div>
-          <div v-if="byCat.length" class="receipt">
-            <div class="r-h"><span>항목별</span><span class="mono">{{ fmt(used) }}원</span></div>
-            <div class="stack"><i v-for="b in byCat" :key="b.c" :style="{ flex: b.v, background: b.color }"></i></div>
-            <div class="legend"><span v-for="b in byCat" :key="b.c"><i :style="{ background: b.color }"></i>{{ b.c }} {{ b.pct }}%</span></div>
-          </div>
-          <div v-if="!expenses.length" class="trv-empty small">쓴 돈을 + 로 적어 두세요</div>
-          <div v-for="g in expByDay" :key="g.key" class="receipt">
-            <div class="r-h"><span>{{ dayTitle(g.key) }}</span><span class="mono">{{ fmt(g.total) }}원</span></div>
-            <div v-for="x in g.items" :key="x.id" class="line" @click="openExpForm(x)">
-              <span class="k" :style="{ background: EXP_COLORS[x.category] }">{{ x.category }}</span>
-              <span class="line-t">{{ x.title }}</span>
-              <span class="amt mono">{{ amountText(x) }}<small v-if="x.currency !== 'KRW'">{{ fmt(x.amount_krw) }}원</small></span>
-            </div>
-          </div>
-        </template>
-
-        <!-- ⑤ 준비물 -->
-        <template v-else>
-          <div class="stamp">
-            <div class="ring" :style="{ background: `conic-gradient(var(--lagoon) 0 ${packPct}%, #e8eef1 0)` }"><span class="mono">{{ packPct }}%</span></div>
-            <div>
-              <div class="stamp-t">{{ packDone }} / {{ packing.length }} 챙김</div>
-              <div class="stamp-s">{{ daysToGo > 0 ? `출발까지 ${daysToGo}일` : daysToGo === 0 ? '오늘 출발' : '출발한 여행' }}</div>
-            </div>
-          </div>
-          <p class="trv-sec">템플릿 불러오기</p>
-          <div class="tpl"><button v-for="(v, k) in PACK_TEMPLATES" :key="k" @click="addTemplate(k)">+ {{ k }}</button></div>
-          <template v-for="g in packGroups" :key="g.name">
-            <div class="grp"><span>{{ g.name }}</span><span class="mono">{{ g.items.filter(x => x.done).length }}/{{ g.items.length }}</span></div>
-            <div v-for="x in g.items" :key="x.id" class="ck" :class="{ done: x.done }" @click="togglePack(x)">
-              <span class="box"></span><span class="ck-t">{{ x.text }}</span>
-              <button class="ck-del" @click.stop="deletePack(x)">✕</button>
-            </div>
-          </template>
-        </template>
       </template>
     </div>
 
-    <button class="trv-fab" @click="onFab">+</button>
+    <!-- 여행 상세 -->
+    <div v-else-if="trip" class="detail" :class="{ 'no-map': !mapVisible }">
+      <!-- 웹: 왼쪽 칸 (날짜·경비·준비물·담아 둔 곳) -->
+      <aside v-if="isWide" class="side">
+        <div class="side-lbl">일정</div>
+        <button v-for="d in days" :key="d.ymd" class="side-day" :class="{ on: sub === 'plan' && d.ymd === dayYmd }" @click="sub = 'plan'; dayYmd = d.ymd; selId = ''">
+          <b>Day {{ d.n }}</b> {{ d.label }}<span class="cnt">{{ itemsOf(d.ymd).length }}</span>
+        </button>
+        <button class="side-day" style="margin-top:8px" :class="{ on: sub === 'money' }" @click="sub = 'money'"><b>💰 경비</b><span class="cnt">{{ trip.budget ? usedPct + '%' : fmt(used) }}</span></button>
+        <button class="side-day" :class="{ on: sub === 'pack' }" @click="sub = 'pack'"><b>🧳 준비물</b><span class="cnt">{{ packDone }}/{{ packing.length }}</span></button>
+        <div class="side-tray">
+          <div class="side-lbl"><span>담아 둔 곳</span><span>{{ trayPlaces.length }}</span></div>
+          <div v-for="p in trayPlaces" :key="p.id" class="tray-chip" draggable="true" @dragstart="onTrayDragStart($event, p)">
+            <i :style="{ background: CATS[p.category]?.color }"></i><span class="tc-name">{{ p.name }}</span>
+            <button class="tc-btn" title="이 날 일정에 넣기" @click="sub = 'plan'; trayToDay(p)">＋</button>
+            <button class="tc-btn" title="고치기" @click="openPlaceForm(p)">⋯</button>
+          </div>
+          <div v-if="trayPlaces.length" class="side-hint">끌어서 일정에 놓거나 ＋</div>
+          <div v-else class="side-hint">검색 칸의 '담아 두기'를 켜고 고르면 여기 모입니다</div>
+        </div>
+      </aside>
+
+      <!-- 휴대폰: 탭 -->
+      <div v-if="!isWide" class="tabs">
+        <button :class="{ on: sub === 'plan' }"  @click="sub = 'plan'">일정</button>
+        <button :class="{ on: sub === 'money' }" @click="sub = 'money'">경비</button>
+        <button :class="{ on: sub === 'pack' }"  @click="sub = 'pack'">준비물</button>
+      </div>
+
+      <!-- 일정 칸 -->
+      <section v-if="sub === 'plan'" class="plan-col">
+        <div v-if="!isWide" class="days">
+          <button v-for="d in days" :key="d.ymd" class="day" :class="{ on: d.ymd === dayYmd }" @click="dayYmd = d.ymd; selId = ''">
+            <b>Day {{ d.n }}</b>{{ d.label }}
+          </button>
+        </div>
+        <div v-if="isWide" class="plan-head">
+          <h2>Day {{ dayOf(dayYmd)?.n }} · {{ dayOf(dayYmd)?.label }}</h2>
+          <span class="meta">일정 {{ dayItems.length }}개{{ dayMoveTotal ? ' · 이동 ' + minLabel(dayMoveTotal) : '' }}</span>
+          <button v-if="mapHidden" class="mini-btn" @click="mapHidden = false">🗺️ 지도 보기</button>
+        </div>
+        <button v-if="!isWide" class="map-toggle" @click="mapOpen = !mapOpen">
+          🗺️ 지도 · 장소 {{ pinCount }}곳<template v-if="dayMoveTotal"> · 이동 {{ minLabel(dayMoveTotal) }}</template>
+          <b>{{ mapOpen ? '접기 ▴' : '펼치기 ▾' }}</b>
+        </button>
+        <!-- 휴대폰 지도 자리: 실제 지도 요소는 아래 map-col 하나를 같이 쓴다 -->
+        <div class="search-wrap">
+          <div class="search" :class="{ tray: toTray }">
+            <span>🔍</span>
+            <input v-model="query" :placeholder="MAPS_KEY ? (toTray ? '장소 검색 → 담아 두기' : `장소 검색 → Day ${dayOf(dayYmd)?.n}에 추가`) : '일정 이름 입력 후 Enter'" @keyup.enter="quickAdd" />
+            <button class="tray-toggle" :class="{ on: toTray }" @click="toTray = !toTray" title="고른 장소를 일정 대신 담아 둡니다">담아 두기</button>
+          </div>
+          <div v-if="suggestions.length || searching" class="sugg-box">
+            <div v-if="searching && !suggestions.length" class="sugg-empty">찾는 중...</div>
+            <button v-for="s in suggestions" :key="s.pred.placeId" class="sugg" :disabled="busy" @click="pickSuggestion(s)">
+              <b>{{ s.main }}</b><span>{{ s.second }}</span>
+            </button>
+          </div>
+        </div>
+
+        <div ref="listEl" class="rows" :class="{ drop: dropOver }"
+             @dragover.prevent="dropOver = true" @dragleave="dropOver = false" @drop.prevent="onListDrop">
+          <div v-if="!dayItems.length" class="trv-empty small">이날 일정이 없습니다. 위에서 검색하거나 + 로 추가하세요</div>
+          <template v-for="(e, i) in dayItems" :key="e.id">
+            <div v-if="drag && i !== drag.from && rankOf(i) === drag.over" class="drop-line"></div>
+            <button v-if="e.prev && !drag" class="leg" :class="{ empty: !e.move_mode }" @click="openLegForm(e)">
+              <template v-if="e.move_mode">{{ MOVES[e.move_mode].icon }} {{ MOVES[e.move_mode].label + (e.move_min ? ' ' + minLabel(e.move_min) : '') }}</template>
+              <template v-else>＋ 이동 방법</template>
+              <a v-if="e.place && e.prev.place_id" class="leg-go" :href="legUrl(e)" target="_blank" rel="noopener" @click.stop>경로 ↗</a>
+            </button>
+            <div data-row class="row" :class="{ sel: e.id === selId, warn: e.warn, dragging: drag && drag.id === e.id }"
+                 :style="drag && drag.id === e.id ? { transform: `translateY(${drag.dy}px)` } : null"
+                 @click="selId = e.id; openItemForm(e)">
+              <span class="grip" title="끌어서 순서 바꾸기" @pointerdown.stop="onGripDown($event, e, i)" @click.stop>⋮⋮</span>
+              <span class="r-t mono" :class="{ none: !e.start_time }">{{ e.start_time ? hhmm(e.start_time) : '—' }}</span>
+              <span class="r-pin" :style="{ background: CATS[e.category]?.color }">{{ e.no }}</span>
+              <span class="r-nm">
+                <b>{{ e.title }}</b>
+                <small v-if="e.end_time || e.memo || (isWide && e.place?.address)">
+                  <template v-if="e.end_time">~{{ hhmm(e.end_time) }}</template><template v-if="e.end_time && (e.memo || e.place?.address)"> · </template>{{ e.memo || (isWide ? e.place?.address : '') }}
+                </small>
+              </span>
+              <a v-if="dirUrl(e.place)" class="r-go" :href="dirUrl(e.place)" target="_blank" rel="noopener" title="여기까지 길찾기" @click.stop>↗</a>
+              <span v-if="e.warn" class="r-warn">{{ e.warn }}</span>
+            </div>
+          </template>
+          <div v-if="drag && drag.over === dayItems.length - 1 && drag.from !== dayItems.length - 1" class="drop-line"></div>
+        </div>
+
+        <!-- 휴대폰: 담아 둔 곳 -->
+        <div v-if="!isWide && trayPlaces.length" class="tray-m">
+          <div class="tray-h"><span>담아 둔 곳</span><span>{{ trayPlaces.length }}</span></div>
+          <div v-for="p in trayPlaces" :key="p.id" class="tray-it">
+            <i :style="{ background: CATS[p.category]?.color }"></i><span class="tc-name" @click="openPlaceForm(p)">{{ p.name }}</span>
+            <button @click="trayToDay(p)">Day {{ dayOf(dayYmd)?.n }}에 넣기</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 지도: 웹은 오른쪽 칸, 휴대폰은 일정 위. 요소 하나를 같이 써서 화면을 바꿔도 다시 만들지 않는다 -->
+      <section v-show="mapVisible" class="map-col">
+        <div ref="mapEl" class="map-canvas"></div>
+        <div v-if="!MAPS_KEY" class="map-off">구글 지도 키를 넣으면 여기에 지도가 보입니다</div>
+        <div v-else-if="mapError" class="map-off">{{ mapError }}</div>
+        <span v-else class="map-tag">{{ mapAllDays ? '전체 일정' : `Day ${dayOf(dayYmd)?.n} · 장소 ${pinCount}곳` }}</span>
+        <div class="map-tools">
+          <button @click="mapAllDays = !mapAllDays">{{ mapAllDays ? '이 날만 보기' : '전체 Day 보기' }}</button>
+          <button v-if="isWide" @click="mapHidden = true">지도 숨기기</button>
+          <button v-else @click="mapOpen = false">접기 ▴</button>
+        </div>
+      </section>
+
+      <!-- 경비 -->
+      <section v-if="sub === 'money'" class="pane">
+        <div class="wallet">
+          <div class="w-lbl">{{ trip.budget ? '남은 예산' : '쓴 돈' }}</div>
+          <div class="w-big mono" :class="{ over: trip.budget && budgetLeft < 0 }">₩{{ fmt(trip.budget ? budgetLeft : used) }}</div>
+          <template v-if="trip.budget">
+            <div class="gauge dark"><i :style="{ width: usedPct + '%' }"></i></div>
+            <div class="w-row mono"><span>예산 {{ fmt(trip.budget) }}</span><span>사용 {{ fmt(used) }}</span></div>
+          </template>
+        </div>
+        <div v-if="fxText" class="fx" @click="openTripForm(trip)">💱 <span class="mono">{{ fxText }}</span><span class="fx-sub">직접 입력</span><span class="fx-edit">바꾸기</span></div>
+        <div v-if="byCat.length" class="receipt">
+          <div class="r-h"><span>항목별</span><span class="mono">{{ fmt(used) }}원</span></div>
+          <div class="stack"><i v-for="b in byCat" :key="b.c" :style="{ flex: b.v, background: b.color }"></i></div>
+          <div class="legend"><span v-for="b in byCat" :key="b.c"><i :style="{ background: b.color }"></i>{{ b.c }} {{ b.pct }}%</span></div>
+        </div>
+        <div v-if="!expenses.length" class="trv-empty small">쓴 돈을 + 로 적어 두세요</div>
+        <div v-for="g in expByDay" :key="g.key" class="receipt">
+          <div class="r-h"><span>{{ dayTitle(g.key) }}</span><span class="mono">{{ fmt(g.total) }}원</span></div>
+          <div v-for="x in g.items" :key="x.id" class="line" @click="openExpForm(x)">
+            <span class="k" :style="{ background: EXP_COLORS[x.category] }">{{ x.category }}</span>
+            <span class="line-t">{{ x.title }}</span>
+            <span class="amt mono">{{ amountText(x) }}<small v-if="x.currency !== 'KRW'">{{ fmt(x.amount_krw) }}원</small></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- 준비물 -->
+      <section v-if="sub === 'pack'" class="pane">
+        <div class="stamp">
+          <div class="ring" :style="{ background: `conic-gradient(var(--lagoon) 0 ${packPct}%, #e8eef1 0)` }"><span class="mono">{{ packPct }}%</span></div>
+          <div>
+            <div class="stamp-t">{{ packDone }} / {{ packing.length }} 챙김</div>
+            <div class="stamp-s">{{ daysToGo > 0 ? `출발까지 ${daysToGo}일` : daysToGo === 0 ? '오늘 출발' : '출발한 여행' }}</div>
+          </div>
+        </div>
+        <p class="trv-sec">템플릿 불러오기</p>
+        <div class="tpl"><button v-for="(v, k) in PACK_TEMPLATES" :key="k" @click="addTemplate(k)">+ {{ k }}</button></div>
+        <template v-for="g in packGroups" :key="g.name">
+          <div class="grp"><span>{{ g.name }}</span><span class="mono">{{ g.items.filter(x => x.done).length }}/{{ g.items.length }}</span></div>
+          <div v-for="x in g.items" :key="x.id" class="ck" :class="{ done: x.done }" @click="togglePack(x)">
+            <span class="box"></span><span class="ck-t">{{ x.text }}</span>
+            <button class="ck-del" @click.stop="deletePack(x)">✕</button>
+          </div>
+        </template>
+      </section>
+    </div>
+
+    <button class="trv-fab" @click="onFab" :title="view === 'list' ? '새 여행' : '추가'">+</button>
 
     <!-- 여행 추가·수정 -->
     <div v-if="tripForm" class="sheet-bg" @click.self="tripForm = null">
@@ -788,63 +1022,66 @@ onMounted(loadTrips)
     </div>
 
     <!-- 일정 추가·수정 -->
-    <div v-if="eventForm" class="sheet-bg" @click.self="eventForm = null">
+    <div v-if="itemForm" class="sheet-bg" @click.self="itemForm = null">
       <div class="sheet">
-        <h3>{{ eventForm.id ? '일정 고치기' : '일정 추가' }}</h3>
-        <label class="f-lab">날짜
-          <select v-model="eventForm.day_date" class="f-in">
-            <option v-for="d in days" :key="d.ymd" :value="d.ymd">Day {{ d.n }} · {{ d.label }}</option>
-          </select>
-        </label>
+        <h3>{{ itemForm.id ? '일정 고치기' : '일정 추가' }}</h3>
+        <input v-model="itemForm.title" class="f-in" placeholder="일정 (예: 라피트 → 난바)" />
+        <div v-if="itemForm.place?.address" class="f-note">📍 {{ itemForm.place.address }}</div>
         <div class="f-row">
-          <label class="f-lab">시작<input v-model="eventForm.start_time" type="time" class="f-in" /></label>
-          <label class="f-lab">끝 (선택)<input v-model="eventForm.end_time" type="time" class="f-in" /></label>
+          <label class="f-lab">날짜
+            <select v-model="itemForm.day_date" class="f-in">
+              <option v-for="d in days" :key="d.ymd" :value="d.ymd">Day {{ d.n }} · {{ d.label }}</option>
+            </select>
+          </label>
         </div>
-        <label v-if="places.length" class="f-lab">장소 (선택)
-          <select v-model="eventForm.place_id" class="f-in" @change="onEventPlace">
-            <option value="">장소 없음</option>
-            <option v-for="p in places" :key="p.id" :value="p.id">{{ p.name }}</option>
-          </select>
-        </label>
-        <input v-model="eventForm.title" class="f-in" placeholder="일정 (예: 라피트 → 난바)" />
+        <div class="f-row">
+          <label class="f-lab">시작 (선택)<input v-model="itemForm.start_time" type="time" class="f-in" /></label>
+          <label class="f-lab">끝 (선택)<input v-model="itemForm.end_time" type="time" class="f-in" /></label>
+        </div>
         <div class="chips">
-          <button v-for="(c, k) in CATS" :key="k" :class="{ on: eventForm.category === k }" :style="{ '--c': c.color }" @click="eventForm.category = k">{{ c.label }}</button>
+          <button v-for="(c, k) in CATS" :key="k" :class="{ on: itemForm.category === k }" :style="{ '--c': c.color }" @click="itemForm.category = k">{{ c.label }}</button>
         </div>
-        <input v-model="eventForm.memo" class="f-in" placeholder="메모 (예약번호, 요금 등)" />
+        <input v-model="itemForm.memo" class="f-in" placeholder="메모 (예약번호, 요금 등)" />
         <div class="f-act">
-          <button v-if="eventForm.id" class="f-del" @click="deleteEvent">삭제</button>
-          <button class="f-cancel" @click="eventForm = null">취소</button>
-          <button class="f-ok" :disabled="busy" @click="saveEvent">저장</button>
+          <button v-if="itemForm.id" class="f-del" @click="deleteItem">삭제</button>
+          <button v-if="itemForm.id && itemForm.place" class="f-cancel" @click="itemToTray">담아 두기로</button>
+          <button class="f-cancel" @click="itemForm = null">취소</button>
+          <button class="f-ok" :disabled="busy" @click="saveItem">저장</button>
         </div>
       </div>
     </div>
 
-    <!-- 장소 추가·수정 -->
+    <!-- 이동 방법 -->
+    <div v-if="legForm" class="sheet-bg" @click.self="legForm = null">
+      <div class="sheet">
+        <h3>이동 방법</h3>
+        <div class="f-note">{{ legForm.from }} → {{ legForm.to }}</div>
+        <div class="chips">
+          <button v-for="(m, k) in MOVES" :key="k" :class="{ on: legForm.mode === k }" style="--c:#16263d" @click="legForm.mode = k">{{ m.icon }} {{ m.label }}</button>
+        </div>
+        <label class="f-lab">걸리는 시간 (분, 선택)<input v-model="legForm.min" type="number" inputmode="numeric" class="f-in" placeholder="15" /></label>
+        <div class="f-act">
+          <button class="f-del" @click="saveLeg(true)">지우기</button>
+          <button class="f-cancel" @click="legForm = null">취소</button>
+          <button class="f-ok" @click="saveLeg(false)">저장</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 담아 둔 곳 고치기 -->
     <div v-if="placeForm" class="sheet-bg" @click.self="placeForm = null">
       <div class="sheet">
-        <h3>{{ placeForm.id ? '장소 고치기' : '장소 추가' }}</h3>
-        <template v-if="MAPS_KEY && !placeForm.id">
-          <input v-model="query" class="f-in" placeholder="🔍 장소 이름으로 검색" />
-          <div v-if="searching" class="sugg-empty">찾는 중...</div>
-          <div v-for="s in suggestions" :key="s.pred.placeId" class="sugg" @click="pickSuggestion(s)">
-            <b>{{ s.main }}</b><span>{{ s.second }}</span>
-          </div>
-        </template>
+        <h3>담아 둔 곳</h3>
         <input v-model="placeForm.name" class="f-in" placeholder="장소 이름" />
-        <div v-if="placeForm.address" class="f-note">{{ placeForm.address }}</div>
-        <input v-model="placeForm.map_url" class="f-in" placeholder="구글 지도 링크 (선택)" @change="onPlaceUrl" />
-        <div class="f-note">
-          <template v-if="placeForm.lat != null">📍 위치 있음 · 지도에 표시됩니다</template>
-          <template v-else>위치 없음 · {{ MAPS_KEY ? '검색으로 고르거나' : '' }} 좌표가 든 지도 링크(@37.5,126.9 형태)를 넣으면 지도에 표시됩니다</template>
-        </div>
+        <div v-if="placeForm.address" class="f-note">📍 {{ placeForm.address }}</div>
         <div class="chips">
           <button v-for="(c, k) in CATS" :key="k" :class="{ on: placeForm.category === k }" :style="{ '--c': c.color }" @click="placeForm.category = k">{{ c.label }}</button>
         </div>
         <input v-model="placeForm.memo" class="f-in" placeholder="메모 (선택)" />
         <div class="f-act">
-          <button v-if="placeForm.id" class="f-del" @click="deletePlace">삭제</button>
+          <button class="f-del" @click="deletePlace">삭제</button>
           <button class="f-cancel" @click="placeForm = null">취소</button>
-          <button class="f-ok" :disabled="busy" @click="savePlace">저장</button>
+          <button class="f-ok" @click="savePlace">저장</button>
         </div>
       </div>
     </div>
@@ -901,6 +1138,7 @@ onMounted(loadTrips)
 .mono { font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Consolas, monospace; font-variant-numeric: tabular-nums; }
 button { font: inherit; color: inherit; }
 
+/* ── 헤더 ── */
 .trv-hdr { position: fixed; top: 0; left: 50%; transform: translateX(-50%); width: 100%; max-width: 480px; z-index: 100;
   background: var(--ink); color: #fff; display: flex; align-items: center; gap: 10px; padding: 0 16px; height: 58px; }
 .trv-title { font-size: 16px; font-weight: 700; margin: 0; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -908,6 +1146,11 @@ button { font: inherit; color: inherit; }
 .trv-route { font-size: 11px; opacity: .6; letter-spacing: 1px; margin-top: 2px; }
 .trv-back { background: none; border: none; color: #fff; font-size: 22px; min-width: 36px; min-height: 44px; cursor: pointer; opacity: .85; padding: 0; text-align: left; }
 .trv-ib { background: none; border: 1px solid rgba(255,255,255,.25); border-radius: 10px; padding: 5px 9px; font-size: 16px; cursor: pointer; min-width: 44px; min-height: 40px; }
+.trv-appnav { margin-left: auto; display: flex; gap: 4px; }
+.trv-appnav button { background: none; border: none; color: #fff; opacity: .65; font-size: 13px; padding: 7px 11px; border-radius: 8px; cursor: pointer; }
+.trv-appnav button:hover { opacity: 1; background: rgba(255,255,255,.08); }
+.trv-appnav button.on { opacity: 1; background: rgba(255,255,255,.14); }
+
 .trv-body { padding: 72px 14px 150px; } /* 아래 메뉴 + 버튼에 마지막 줄이 가리지 않게 */
 .trv-sec { font-size: 11px; font-weight: 700; color: var(--sub); letter-spacing: 1.2px; margin: 6px 2px 8px; }
 .trv-empty { text-align: center; color: var(--sub); padding: 60px 10px; font-size: 14px; line-height: 1.6; }
@@ -915,7 +1158,7 @@ button { font: inherit; color: inherit; }
 .trv-fab { position: fixed; bottom: calc(74px + env(safe-area-inset-bottom, 0px)); right: max(16px, calc(50% - 224px)); width: 54px; height: 54px;
   border-radius: 16px; border: none; background: var(--lagoon); color: #fff !important; font-size: 28px; cursor: pointer; z-index: 99; box-shadow: 0 6px 18px rgba(15,124,140,.4); }
 
-/* 탑승권 카드 */
+/* ── 탑승권 카드 ── */
 .pass { display: flex; background: #fff; border-radius: 14px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(22,38,61,.06); overflow: hidden; cursor: pointer; }
 .pass-main { flex: 1; min-width: 0; padding: 14px 14px 12px; }
 .pass-stub { width: 80px; border-left: 2px dashed var(--line); position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; background: #fbfcfd; }
@@ -939,43 +1182,78 @@ button { font: inherit; color: inherit; }
 .gauge i { display: block; height: 100%; background: var(--lagoon); }
 .gauge.dark { background: rgba(255,255,255,.15); } .gauge.dark i { background: var(--sun); }
 
-/* 상세 */
+/* ── 상세 (휴대폰) ── */
+.detail { padding: 72px 14px 150px; display: flex; flex-direction: column; }
 .tabs { display: flex; gap: 18px; padding: 0 4px; border-bottom: 1px solid var(--line); margin-bottom: 12px; }
 .tabs button { background: none; border: none; font-size: 14px; padding: 8px 0 9px; color: var(--sub); cursor: pointer; }
 .tabs button.on { color: var(--ink); font-weight: 700; box-shadow: inset 0 -2px 0 var(--lagoon); }
-.days { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 12px; padding-bottom: 2px; }
-.day { flex-shrink: 0; border-radius: 10px; padding: 6px 11px; font-size: 11px; color: var(--sub); background: #fff; border: 1px solid var(--line); cursor: pointer; }
+.days { display: flex; gap: 6px; overflow-x: auto; margin-bottom: 10px; padding-bottom: 2px; }
+.day { flex-shrink: 0; border-radius: 10px; padding: 6px 11px; font-size: 11px; color: var(--sub); background: #fff; border: 1px solid var(--line); cursor: pointer; text-align: left; }
 .day b { display: block; font-size: 13px; color: var(--ink); }
 .day.on { background: var(--ink); border-color: var(--ink); color: rgba(255,255,255,.7); }
 .day.on b { color: #fff; }
-.map { border-radius: 14px; overflow: hidden; height: 200px; background: #d6e0e6; margin-bottom: 12px; position: relative; }
+.map-toggle { width: 100%; display: flex; align-items: center; gap: 6px; background: #fff; border: none; border-radius: 11px; padding: 10px 12px; font-size: 13px; margin-bottom: 10px; cursor: pointer; text-align: left; }
+.map-toggle b { margin-left: auto; color: var(--lagoon); font-size: 12px; }
+/* 휴대폰: 지도 요소는 일정 칸 밖에 하나만 두고, 일정 칸을 풀어(display: contents)
+   '지도' 줄과 검색 칸 사이로 끼워 넣는다 */
+.trv:not(.wide) .plan-col { display: contents; }
+.trv:not(.wide) .tabs { order: 1; }
+.trv:not(.wide) .days { order: 2; }
+.trv:not(.wide) .map-toggle { order: 3; }
+.trv:not(.wide) .map-col { order: 4; }
+.trv:not(.wide) .search-wrap { order: 5; }
+.trv:not(.wide) .rows { order: 6; }
+.trv:not(.wide) .tray-m { order: 7; }
+.trv:not(.wide) .pane { order: 8; }
+.map-col { position: relative; height: 210px; border-radius: 14px; overflow: hidden; background: #d6e0e6; margin: -2px 0 12px; }
 .map-canvas { position: absolute; inset: 0; }
 .map-off { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; padding: 20px; font-size: 13px; color: var(--sub); }
 .map-tag { position: absolute; left: 8px; top: 8px; background: rgba(22,38,61,.85); color: #fff; font-size: 11px; border-radius: 8px; padding: 4px 8px; pointer-events: none; }
+.map-tools { position: absolute; right: 8px; top: 8px; display: flex; gap: 6px; }
+.map-tools button { background: #fff; border: none; border-radius: 8px; padding: 5px 9px; font-size: 11px; box-shadow: 0 2px 6px rgba(0,0,0,.15); cursor: pointer; }
 
-.tl { position: relative; margin-left: 52px; }
-.tl::before { content: ""; position: absolute; left: -14px; top: 6px; bottom: 6px; width: 2px; background: var(--line); }
-.ev { position: relative; background: #fff; border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; }
-.ev::before { content: ""; position: absolute; left: -19px; top: 14px; width: 10px; height: 10px; border-radius: 50%; background: var(--c, #999); box-shadow: 0 0 0 3px var(--bg); }
-.ev-t { position: absolute; left: -66px; top: 10px; width: 40px; text-align: right; font-size: 12px; font-weight: 700; }
-.ev-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
-.ev-sub { font-size: 12px; color: var(--sub); margin-top: 3px; }
-.go { margin-left: auto; font-size: 11px; color: var(--lagoon); font-weight: 700; white-space: nowrap; text-decoration: none; }
-.ev.clash { box-shadow: inset 0 0 0 2px #ffc9a8; }
-.warn { font-size: 12px; color: var(--red); background: var(--red-soft); border-radius: 8px; padding: 5px 8px; margin-top: 6px; }
+.search-wrap { position: relative; margin-bottom: 10px; }
+.search { display: flex; align-items: center; gap: 8px; background: #fff; border: 1.5px solid var(--lagoon); border-radius: 12px; padding: 4px 6px 4px 11px; }
+.search.tray { border-style: dashed; }
+.search input { flex: 1; min-width: 0; border: none; outline: none; font-size: 14px; padding: 7px 0; background: none; color: var(--ink); }
+.tray-toggle { border: 1px solid var(--line); background: #fff; border-radius: 8px; font-size: 11px; padding: 5px 8px; color: var(--sub); cursor: pointer; white-space: nowrap; }
+.tray-toggle.on { background: var(--sun-soft); border-color: var(--sun); color: #7a5200; font-weight: 700; }
+.sugg-box { position: absolute; left: 0; right: 0; top: calc(100% + 4px); background: #fff; border-radius: 12px; box-shadow: 0 8px 24px rgba(22,38,61,.18); z-index: 20; padding: 4px; }
+.sugg { display: flex; flex-direction: column; width: 100%; text-align: left; padding: 9px 10px; border-radius: 9px; background: none; border: none; cursor: pointer; }
+.sugg:hover { background: #f3f7f9; }
+.sugg b { font-size: 14px; } .sugg span { font-size: 12px; color: var(--sub); }
+.sugg-empty { font-size: 12px; color: var(--sub); padding: 9px 10px; }
 
-.place { display: flex; align-items: center; gap: 10px; background: #fff; border-radius: 12px; padding: 10px 12px; margin-bottom: 7px; cursor: pointer; }
-.place.sel { box-shadow: inset 0 0 0 2px var(--lagoon); }
-.pin { width: 26px; height: 26px; border-radius: 50% 50% 50% 0; transform: rotate(-45deg); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-.pin span { transform: rotate(45deg); font-size: 11px; color: #fff; font-weight: 700; }
-.place-txt { min-width: 0; flex: 1; }
-.place-nm { font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.place-src { font-size: 11px; color: var(--faint); margin-top: 2px; }
-.assign { font-size: 11px; border-radius: 8px; padding: 4px 8px; white-space: nowrap; background: none; }
-.assign.set { background: var(--lagoon-soft); color: var(--lagoon); font-weight: 700; }
-.assign.none { border: 1px dashed #c6d1d9; color: var(--sub); cursor: pointer; }
-.mini-edit { background: none; border: none; color: var(--faint); font-size: 16px; cursor: pointer; padding: 4px; }
+.rows { min-height: 40px; border-radius: 12px; }
+.rows.drop { box-shadow: inset 0 0 0 2px var(--lagoon); background: var(--lagoon-soft); }
+.row { position: relative; display: grid; grid-template-columns: 18px 42px 24px 1fr auto; align-items: center; gap: 8px; background: #fff; border-radius: 11px; padding: 9px 10px; cursor: pointer; }
+.row.sel { box-shadow: inset 0 0 0 2px var(--lagoon); }
+.row.warn { box-shadow: inset 0 0 0 2px #ffc9a8; }
+.row.dragging { z-index: 5; box-shadow: 0 10px 24px rgba(22,38,61,.25); opacity: .95; }
+.grip { color: #b9c5ce; font-size: 13px; letter-spacing: -3px; cursor: grab; touch-action: none; user-select: none; padding: 6px 0; text-align: center; }
+.r-t { font-size: 12px; font-weight: 700; }
+.r-t.none { color: var(--faint); font-weight: 400; text-align: center; }
+.r-pin { width: 22px; height: 22px; border-radius: 50%; color: #fff; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+.r-nm { min-width: 0; }
+.r-nm b { display: block; font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.r-nm small { display: block; font-size: 11px; color: var(--sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.r-go { color: var(--lagoon); font-weight: 700; text-decoration: none; padding: 4px 6px; }
+.r-warn { grid-column: 3 / -1; font-size: 11px; color: var(--red); background: var(--red-soft); border-radius: 6px; padding: 3px 7px; }
+.leg { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: none; padding: 4px 0 4px 76px; font-size: 12px; color: var(--sub); cursor: pointer; text-align: left; min-height: 28px; }
+.leg.empty { color: var(--faint); }
+.leg-go { margin-left: auto; margin-right: 8px; font-size: 11px; color: var(--lagoon); font-weight: 700; text-decoration: none; }
+.leg:not(:hover) .leg-go { opacity: .8; }
+.drop-line { height: 3px; background: var(--lagoon); border-radius: 3px; margin: 3px 0; }
+.mini-btn { border: 1px solid var(--line); background: #fff; border-radius: 9px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
 
+.tray-m { margin-top: 12px; background: #fff; border: 1.5px dashed #c6d1d9; border-radius: 12px; padding: 10px 12px; }
+.tray-h { display: flex; justify-content: space-between; font-size: 12px; font-weight: 700; color: var(--sub); margin-bottom: 4px; }
+.tray-it { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 0; }
+.tray-it i, .tray-chip i { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.tray-it .tc-name { flex: 1; min-width: 0; cursor: pointer; }
+.tray-it button { border: none; background: var(--lagoon-soft); color: var(--lagoon); font-weight: 700; font-size: 11px; border-radius: 8px; padding: 5px 8px; cursor: pointer; white-space: nowrap; }
+
+/* ── 경비 ── */
 .wallet { background: var(--ink); color: #fff; border-radius: 16px; padding: 16px; margin-bottom: 10px; }
 .w-lbl { font-size: 11px; opacity: .6; letter-spacing: 1px; }
 .w-big { font-size: 26px; font-weight: 800; margin: 4px 0 6px; }
@@ -994,6 +1272,7 @@ button { font: inherit; color: inherit; }
 .amt { margin-left: auto; text-align: right; white-space: nowrap; }
 .amt small { display: block; color: var(--faint); font-size: 11px; }
 
+/* ── 준비물 ── */
 .stamp { display: flex; align-items: center; gap: 12px; background: #fff; border-radius: 14px; padding: 12px 14px; margin-bottom: 10px; }
 .ring { width: 46px; height: 46px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .ring span { width: 36px; height: 36px; border-radius: 50%; background: #fff; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; }
@@ -1007,9 +1286,48 @@ button { font: inherit; color: inherit; }
 .ck.done .ck-t { color: var(--faint); text-decoration: line-through; }
 .ck-del { margin-left: auto; background: none; border: none; color: #c6d1d9; cursor: pointer; padding: 2px 6px; }
 
-/* 시트 */
+/* ── 웹 모드: 화면 전체를 쓰는 세 칸 ── */
+.trv.wide { position: fixed; inset: 0; z-index: 150; overflow: hidden; display: flex; flex-direction: column; }
+.trv.wide .trv-hdr { position: static; transform: none; max-width: none; left: auto; flex-shrink: 0; padding: 0 20px; }
+.trv.wide .trv-fab { bottom: 24px; right: 24px; }
+.trv.wide .list-body { flex: 1; overflow: auto; padding: 24px 24px 100px; }
+.trv.wide .list-body > * { max-width: 920px; margin-left: auto; margin-right: auto; }
+.trv.wide .pass-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.trv.wide .pass-grid .pass { margin-bottom: 0; }
+.trv.wide .detail { flex: 1; min-height: 0; padding: 0; display: grid; grid-template-columns: 210px minmax(380px, 460px) 1fr; }
+.trv.wide .detail.no-map { grid-template-columns: 210px minmax(380px, 720px) 1fr; }
+.side { border-right: 1px solid var(--line); background: #f6f8f9; padding: 14px 10px; overflow: auto; display: flex; flex-direction: column; gap: 4px; }
+.side-lbl { font-size: 11px; font-weight: 700; color: var(--sub); letter-spacing: 1.2px; margin: 2px 6px 4px; display: flex; justify-content: space-between; }
+.side-day { display: flex; align-items: center; gap: 8px; width: 100%; background: none; border: none; border-radius: 10px; padding: 9px 10px; font-size: 12px; color: var(--sub); cursor: pointer; text-align: left; }
+.side-day b { font-size: 13px; color: var(--ink); }
+.side-day:hover { background: #e9eff2; }
+.side-day .cnt { margin-left: auto; font-size: 11px; background: #e3e9ed; border-radius: 8px; padding: 1px 7px; }
+.side-day.on { background: var(--ink); color: rgba(255,255,255,.7); }
+.side-day.on b { color: #fff; } .side-day.on .cnt { background: rgba(255,255,255,.15); color: #fff; }
+.side-tray { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.tray-chip { display: flex; align-items: center; gap: 6px; background: #fff; border: 1px dashed #c6d1d9; border-radius: 9px; padding: 6px 6px 6px 9px; font-size: 12px; margin-bottom: 5px; cursor: grab; }
+.tray-chip .tc-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tc-btn { border: none; background: none; color: var(--sub); cursor: pointer; padding: 2px 5px; border-radius: 6px; }
+.tc-btn:hover { background: var(--lagoon-soft); color: var(--lagoon); }
+.side-hint { font-size: 11px; color: var(--faint); margin: 6px 4px 0; line-height: 1.5; }
+.trv.wide .plan-col { overflow: auto; padding: 14px 16px 90px; border-right: 1px solid var(--line); min-height: 0; }
+.plan-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.plan-head h2 { margin: 0; font-size: 16px; }
+.plan-head .meta { font-size: 12px; color: var(--sub); }
+.plan-head .mini-btn { margin-left: auto; }
+.trv.wide .map-col { height: auto; margin: 0; border-radius: 0; min-height: 0; }
+.trv.wide .map-tag { left: 12px; top: 12px; font-size: 12px; padding: 6px 10px; }
+.trv.wide .map-tools { right: 12px; top: 12px; }
+.trv.wide .map-tools button { font-size: 12px; padding: 6px 10px; }
+.trv.wide .pane { grid-column: 2 / 4; overflow: auto; padding: 18px 24px 90px; min-height: 0; }
+.trv.wide .pane > * { max-width: 680px; }
+.trv.wide .row { padding: 8px 10px; }
+
+/* ── 시트 ── */
 .sheet-bg { position: fixed; inset: 0; background: rgba(22,38,61,.45); z-index: 300; display: flex; align-items: flex-end; justify-content: center; }
+.trv.wide .sheet-bg { align-items: center; }
 .sheet { background: #fff; width: 100%; max-width: 480px; border-radius: 20px 20px 0 0; padding: 18px 16px calc(18px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 10px; max-height: 88vh; overflow-y: auto; }
+.trv.wide .sheet { border-radius: 18px; }
 .sheet h3 { margin: 0 0 2px; font-size: 16px; }
 .f-row { display: flex; gap: 8px; }
 .f-lab { flex: 1; display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--sub); min-width: 0; }
@@ -1019,14 +1337,12 @@ button { font: inherit; color: inherit; }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .chips button { border: 1px solid var(--line); background: #fff; border-radius: 16px; padding: 6px 12px; font-size: 13px; cursor: pointer; }
 .chips button.on { background: var(--c); border-color: var(--c); color: #fff; font-weight: 700; }
-.sugg { display: flex; flex-direction: column; padding: 9px 10px; border-radius: 10px; background: #f3f7f9; cursor: pointer; margin-top: -4px; }
-.sugg b { font-size: 14px; } .sugg span { font-size: 12px; color: var(--sub); }
-.sugg-empty { font-size: 12px; color: var(--sub); }
-.f-act { display: flex; gap: 8px; margin-top: 4px; }
+.f-act { display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
 .f-act button { padding: 13px 14px; border-radius: 12px; font-size: 15px; cursor: pointer; border: 1px solid var(--line); background: #fff; }
 .f-cancel { flex: 1; color: var(--sub); }
 .f-ok { flex: 2; background: var(--lagoon) !important; color: #fff !important; border-color: var(--lagoon) !important; font-weight: 700; }
 .f-ok:disabled { opacity: .5; }
 .f-del { color: var(--red); }
-button:focus-visible, .f-in:focus-visible { outline: 2px solid var(--lagoon); outline-offset: 2px; }
+button:focus-visible, .f-in:focus-visible, .search input:focus-visible { outline: 2px solid var(--lagoon); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
