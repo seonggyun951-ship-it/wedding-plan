@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { createClient } from '@supabase/supabase-js'
+import TravelTab from './TravelTab.vue'
 
 const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
@@ -368,8 +369,11 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
       </div>
 
       <template v-else>
+        <!-- 여행 탭: 헤더·화면·버튼을 따로 갖는다 -->
+        <TravelTab v-if="tab==='travel'" :supabase="supabase" :user-id="currentUserId" @logout="logout" />
+
         <!-- 헤더 -->
-        <header class="app-header">
+        <header v-if="tab!=='travel'" class="app-header">
           <div class="header-inner">
             <button v-if="tab==='home' && view==='detail'" @click="view='home'" class="back-btn">←</button>
             <h1 class="header-title">
@@ -392,7 +396,7 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
         </div>
 
         <!-- 메인 -->
-        <main class="main-content">
+        <main v-if="tab!=='travel'" class="main-content">
           <template v-if="tab==='home'">
 
             <!-- 홈 뷰 -->
@@ -629,6 +633,9 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
           <button class="nav-btn" :class="{ active: tab==='realestate' }" @click="tab='realestate'">
             <span class="nav-icon">🏠</span><span class="nav-label">부동산</span>
           </button>
+          <button class="nav-btn travel" :class="{ active: tab==='travel' }" @click="tab='travel'">
+            <span class="nav-icon">✈️</span><span class="nav-label">여행</span>
+          </button>
         </nav>
 
         <!-- 체크리스트 추가 모달 -->
@@ -817,6 +824,7 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
 .bottom-nav { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: 100%; max-width: 480px; background: white; border-top: 1px solid #f0e8e8; display: flex; padding-bottom: env(safe-area-inset-bottom,0); z-index: 100; }
 .nav-btn { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 10px 0; background: none; border: none; cursor: pointer; color: #ccc; }
 .nav-btn.active { color: #ff6b6b; }
+.nav-btn.active.travel { color: #0f7c8c; }
 .nav-icon { font-size: 22px; }
 .nav-label { font-size: 11px; font-weight: 600; }
 
