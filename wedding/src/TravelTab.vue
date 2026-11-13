@@ -372,15 +372,33 @@ async function deletePlace() {
 
 // ── 구간 이동 방법 (직접 고르기) ────────────────────────────
 const legForm = ref(null)
-function openLegForm(e) { legForm.value = { id: e.id, from: e.prev.title, to: e.title, mode: e.move_mode || 'walk', min: e.move_min || '' } }
+function openLegForm(e) {
+  const m = Number(e.move_min) || 0
+  legForm.value = { id: e.id, from: e.prev.title, to: e.title, mode: e.move_mode || 'walk', h: m >= 60 ? Math.floor(m / 60) : '', m: m ? m % 60 : '' }
+}
+// 시간·분 두 칸을 분으로 합친다. 분 칸에 80을 넣어도 1시간 20분이 된다.
+const legTotal = (f) => (Number(f.h) || 0) * 60 + (Number(f.m) || 0)
 async function saveLeg(clear) {
   const f = legForm.value
-  const row = clear ? { move_mode: null, move_min: null } : { move_mode: f.mode, move_min: Number(f.min) || null }
+  const total = legTotal(f)
+  const row = clear ? { move_mode: null, move_min: null } : { move_mode: f.mode, move_min: total > 0 ? total : null }
   const { error } = await db.from('trip_events').update(row).eq('id', f.id)
   if (error) return fail('이동 방법 저장', error)
   Object.assign(events.value.find(x => x.id === f.id), row)
   legForm.value = null
 }
+// 구간을 누르면 지도가 그 구간 두 장소로 이동한다 (휴대폰은 지도가 접혀 있으면 편다)
+const legFocus = ref('')   // 도착 쪽 일정 id
+function focusLeg(e) {
+  legFocus.value = e.id
+  selId.value = ''
+  mapAllDays.value = false
+  if (isWide.value) mapHidden.value = false
+  else mapOpen.value = true
+}
+// 일정 줄을 고르거나 날을 바꾸면 구간 강조는 푼다
+watch(selId, (v) => { if (v) legFocus.value = '' })
+watch(dayYmd, () => { legFocus.value = '' })
 const ptOf = (e) => {
   const p = placeById(e.place_id)
   if (p && p.lat != null) return `${p.lat},${p.lng}`
@@ -398,26 +416,58 @@ const dirUrl = (p) => {
 }
 
 // ── 끌어서 순서 바꾸기 (마우스·손가락 공통: pointer 이벤트) ──
+// 하루 일정이 길면 화면 밖 자리로도 옮길 수 있어야 해서, 끄는 동안 위·아래 끝에 닿으면
+// 저절로 스크롤한다. 줄 위치는 스크롤과 무관한 '내용 좌표'(화면 좌표 + 스크롤 양)로 잰다.
+// 스크롤되는 곳: 웹은 일정 칸(.plan-col), 휴대폰은 페이지 전체(window).
 const listEl = ref(null)
-const drag = ref(null)   // { id, from, over, dy, startY, mids }
+const drag = ref(null)   // { id, from, over, dy, startY, mids, lastY }
+let autoRaf = 0
+const scrollerOf = () => (isWide.value ? listEl.value?.closest('.plan-col') : null)
+const scrollTopOf = (s) => (s ? s.scrollTop : window.scrollY)
 function onGripDown(ev, e, index) {
   ev.preventDefault()
+  const st = scrollTopOf(scrollerOf())
   const rows = [...listEl.value.querySelectorAll('[data-row]')]
-  const mids = rows.map(r => { const b = r.getBoundingClientRect(); return b.top + b.height / 2 })
-  drag.value = { id: e.id, from: index, over: index, dy: 0, startY: ev.clientY, mids }
+  const mids = rows.map(r => { const b = r.getBoundingClientRect(); return b.top + b.height / 2 + st })
+  drag.value = { id: e.id, from: index, over: index, dy: 0, startY: ev.clientY + st, mids, lastY: ev.clientY }
   window.addEventListener('pointermove', onDragMove)
   window.addEventListener('pointerup', onDragEnd)
   window.addEventListener('pointercancel', onDragEnd)
+  autoRaf = requestAnimationFrame(autoScroll)
+}
+function updateDrag() {
+  const d = drag.value; if (!d) return
+  const y = d.lastY + scrollTopOf(scrollerOf())
+  d.dy = y - d.startY
+  d.over = d.mids.filter((m, i) => i !== d.from && m < y).length
 }
 function onDragMove(ev) {
   const d = drag.value; if (!d) return
-  d.dy = ev.clientY - d.startY
-  d.over = d.mids.filter((m, i) => i !== d.from && m < ev.clientY).length
+  d.lastY = ev.clientY
+  updateDrag()
+}
+function autoScroll() {
+  const d = drag.value
+  if (!d) { autoRaf = 0; return }
+  const s = scrollerOf()
+  const box = s ? s.getBoundingClientRect() : null
+  // 휴대폰은 위 헤더(58px)와 아래 메뉴(약 70px)가 화면을 가리므로 그만큼 안쪽을 끝으로 본다
+  const top = (box ? box.top : 58) + 60
+  const bottom = (box ? box.bottom : window.innerHeight - 70) - 60
+  let v = 0
+  if (d.lastY < top) v = -Math.ceil((top - d.lastY) / 5)
+  else if (d.lastY > bottom) v = Math.ceil((d.lastY - bottom) / 5)
+  if (v) {
+    if (s) s.scrollTop += v; else window.scrollBy(0, v)
+    updateDrag()
+  }
+  autoRaf = requestAnimationFrame(autoScroll)
 }
 async function onDragEnd() {
   window.removeEventListener('pointermove', onDragMove)
   window.removeEventListener('pointerup', onDragEnd)
   window.removeEventListener('pointercancel', onDragEnd)
+  cancelAnimationFrame(autoRaf); autoRaf = 0
   const d = drag.value; drag.value = null
   if (!d || d.over === d.from) return
   const list = itemsOf(dayYmd.value)
@@ -529,6 +579,20 @@ async function drawPins() {
     if (pts.length > 1) mapLines.push(new g.Polyline({ map: m, path: pts, strokeColor: '#16263d', strokeOpacity: mapAllDays.value ? 0.35 : 0.55, strokeWeight: 3 }))
     all.push(...pts)
   })
+  // 고른 구간: 두 장소를 잇는 선을 굵게 그리고 둘이 한눈에 들어오게 맞춘다
+  const lf = !mapAllDays.value && legFocus.value && events.value.find(e => e.id === legFocus.value)
+  if (lf) {
+    const list = itemsOf(lf.day_date)
+    const prev = list[list.findIndex(x => x.id === lf.id) - 1]
+    const pts = [prev && placeById(prev.place_id), placeById(lf.place_id)]
+      .filter(p => p && p.lat != null).map(p => ({ lat: p.lat, lng: p.lng }))
+    if (pts.length === 2) {
+      mapLines.push(new g.Polyline({ map: m, path: pts, strokeColor: '#f0a020', strokeOpacity: 1, strokeWeight: 6, zIndex: 5 }))
+      const b = new g.LatLngBounds(); pts.forEach(p => b.extend(p)); m.fitBounds(b, isWide.value ? 80 : 36)
+      return
+    }
+    if (pts.length === 1) { m.panTo(pts[0]); if (m.getZoom() < 14) m.setZoom(15); return }
+  }
   const selItem = events.value.find(e => e.id === selId.value)
   const selP = selItem && placeById(selItem.place_id)
   if (selP && selP.lat != null && !mapAllDays.value) { m.panTo({ lat: selP.lat, lng: selP.lng }); if (m.getZoom() < 14) m.setZoom(15); return }
@@ -536,7 +600,7 @@ async function drawPins() {
   else if (all.length > 1) { const b = new g.LatLngBounds(); all.forEach(p => b.extend(p)); m.fitBounds(b, 40) }
 }
 const pinCount = computed(() => dayItems.value.filter(e => e.place?.lat != null).length)
-watch([mapVisible, dayYmd, selId, mapAllDays, places, events, isWide], drawPins, { deep: true })
+watch([mapVisible, dayYmd, selId, legFocus, mapAllDays, places, events, isWide], drawPins, { deep: true })
 
 // ── 장소 검색 (Places API New: 자동완성 → 고른 장소의 위치·주소만 받음) ──
 // 이름·종류는 자동완성 결과에서 쓰고, 상세 조회는 위치·주소만 받아 가장 싼 등급으로 끝낸다.
@@ -755,6 +819,8 @@ onUnmounted(() => {
   wideMq?.removeEventListener('change', onWide)
   window.removeEventListener('pointermove', onDragMove)
   window.removeEventListener('pointerup', onDragEnd)
+  window.removeEventListener('pointercancel', onDragEnd)
+  cancelAnimationFrame(autoRaf)
 })
 </script>
 
@@ -889,11 +955,15 @@ onUnmounted(() => {
           <div v-if="!dayItems.length" class="trv-empty small">이날 일정이 없습니다. 위에서 검색하거나 + 로 추가하세요</div>
           <template v-for="(e, i) in dayItems" :key="e.id">
             <div v-if="drag && i !== drag.from && rankOf(i) === drag.over" class="drop-line"></div>
-            <button v-if="e.prev && !drag" class="leg" :class="{ empty: !e.move_mode }" @click="openLegForm(e)">
-              <template v-if="e.move_mode">{{ MOVES[e.move_mode].icon }} {{ MOVES[e.move_mode].label + (e.move_min ? ' ' + minLabel(e.move_min) : '') }}</template>
-              <template v-else>＋ 이동 방법</template>
+            <div v-if="e.prev && !drag" class="leg" :class="{ empty: !e.move_mode, focus: e.id === legFocus }"
+                 role="button" tabindex="0" title="지도에서 이 구간 보기" @click="focusLeg(e)" @keyup.enter="focusLeg(e)">
+              <span class="leg-txt">
+                <template v-if="e.move_mode">{{ MOVES[e.move_mode].icon }} {{ MOVES[e.move_mode].label + (e.move_min ? ' ' + minLabel(e.move_min) : '') }}</template>
+                <template v-else>이동 방법 미정</template>
+              </span>
+              <button class="leg-edit" :title="e.move_mode ? '이동 방법 고치기' : '이동 방법 넣기'" @click.stop="openLegForm(e)">✎</button>
               <a v-if="e.place && e.prev.place_id" class="leg-go" :href="legUrl(e)" target="_blank" rel="noopener" @click.stop>경로 ↗</a>
-            </button>
+            </div>
             <div data-row class="row" :class="{ sel: e.id === selId, warn: e.warn, dragging: drag && drag.id === e.id }"
                  :style="drag && drag.id === e.id ? { transform: `translateY(${drag.dy}px)` } : null"
                  @click="selId = e.id; openItemForm(e)">
@@ -1059,7 +1129,12 @@ onUnmounted(() => {
         <div class="chips">
           <button v-for="(m, k) in MOVES" :key="k" :class="{ on: legForm.mode === k }" style="--c:#16263d" @click="legForm.mode = k">{{ m.icon }} {{ m.label }}</button>
         </div>
-        <label class="f-lab">걸리는 시간 (분, 선택)<input v-model="legForm.min" type="number" inputmode="numeric" class="f-in" placeholder="15" /></label>
+        <div class="f-lab">걸리는 시간 (선택)</div>
+        <div class="f-row" style="align-items:center;margin-top:-6px">
+          <input v-model="legForm.h" type="number" inputmode="numeric" min="0" class="f-in" placeholder="0" aria-label="시간" /><span class="unit">시간</span>
+          <input v-model="legForm.m" type="number" inputmode="numeric" min="0" class="f-in" placeholder="0" aria-label="분" /><span class="unit">분</span>
+        </div>
+        <div v-if="legTotal(legForm) >= 60 && Number(legForm.m) >= 60" class="f-note">= {{ minLabel(legTotal(legForm)) }}</div>
         <div class="f-act">
           <button class="f-del" @click="saveLeg(true)">지우기</button>
           <button class="f-cancel" @click="legForm = null">취소</button>
@@ -1239,10 +1314,14 @@ button { font: inherit; color: inherit; }
 .r-nm small { display: block; font-size: 11px; color: var(--sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .r-go { color: var(--lagoon); font-weight: 700; text-decoration: none; padding: 4px 6px; }
 .r-warn { grid-column: 3 / -1; font-size: 11px; color: var(--red); background: var(--red-soft); border-radius: 6px; padding: 3px 7px; }
-.leg { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: none; padding: 4px 0 4px 76px; font-size: 12px; color: var(--sub); cursor: pointer; text-align: left; min-height: 28px; }
+.leg { display: flex; align-items: center; gap: 4px; width: 100%; padding: 3px 0 3px 76px; font-size: 12px; color: var(--sub); cursor: pointer; min-height: 30px; border-radius: 8px; }
+.leg:hover { background: rgba(15,124,140,.06); }
 .leg.empty { color: var(--faint); }
+.leg.focus { color: #7a5200; background: var(--sun-soft); }
+.leg-edit { border: none; background: none; color: var(--sub); font-size: 13px; padding: 3px 7px; border-radius: 6px; cursor: pointer; }
+.leg-edit:hover { background: #fff; color: var(--lagoon); }
 .leg-go { margin-left: auto; margin-right: 8px; font-size: 11px; color: var(--lagoon); font-weight: 700; text-decoration: none; }
-.leg:not(:hover) .leg-go { opacity: .8; }
+.unit { font-size: 13px; color: var(--sub); white-space: nowrap; }
 .drop-line { height: 3px; background: var(--lagoon); border-radius: 3px; margin: 3px 0; }
 .mini-btn { border: 1px solid var(--line); background: #fff; border-radius: 9px; padding: 6px 10px; font-size: 12px; cursor: pointer; }
 
