@@ -6,7 +6,7 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 //
 // 장소와 일정은 한 화면이다. 일정 한 줄(trip_events)이 장소(trip_places)를 가리키고,
 // 일정에 안 들어간 장소는 '담아 둔 곳'으로 모인다. 순서는 sort_order, 앞 줄에서 오는
-// 구간의 이동 방법·시간은 그 줄의 move_mode / move_min 에 적는다.
+// 구간의 이동 방법·시간·설명은 그 줄의 move_mode / move_min / move_note 에 적는다.
 const props = defineProps({
   supabase: { type: Object, required: true },
   userId:   { type: String, required: true },
@@ -22,12 +22,14 @@ const CATS = {
   food: { label: '맛집', color: '#e8890c' },
   spot: { label: '명소', color: '#0f7c8c' },
 }
+// hint: 구간 설명(move_note) 칸 예시
 const MOVES = {
-  walk:    { label: '도보',     icon: '🚶', travel: 'walking' },
-  transit: { label: '대중교통', icon: '🚇', travel: 'transit' },
-  taxi:    { label: '택시',     icon: '🚕', travel: 'driving' },
-  car:     { label: '자동차',   icon: '🚗', travel: 'driving' },
-  etc:     { label: '기타',     icon: '➡️', travel: '' },
+  walk:    { label: '도보',     icon: '🚶', travel: 'walking', hint: '예: 강변 따라' },
+  transit: { label: '대중교통', icon: '🚇', travel: 'transit', hint: '예: 지하철 2호선' },
+  taxi:    { label: '택시',     icon: '🚕', travel: 'driving', hint: '예: 우버' },
+  car:     { label: '자동차',   icon: '🚗', travel: 'driving', hint: '예: 렌터카' },
+  flight:  { label: '비행기',   icon: '✈️', travel: '',        hint: '예: KE723' },
+  etc:     { label: '기타',     icon: '➡️', travel: '',        hint: '예: 페리' },
 }
 const EXP_CATS = ['숙소', '항공', '교통', '식비', '관광', '쇼핑', '기타']
 const EXP_COLORS = { 숙소:'#7a5af0', 항공:'#3b82c4', 교통:'#0f7c8c', 식비:'#e8890c', 관광:'#2f9e44', 쇼핑:'#d6336c', 기타:'#868e96' }
@@ -336,7 +338,7 @@ async function saveItem() {
     } else {
       const old = events.value.find(x => x.id === f.id)
       const movedDay = old.day_date !== row.day_date
-      const res = await db.from('trip_events').update(movedDay ? { ...row, move_mode: null, move_min: null } : row).eq('id', f.id).select().single()
+      const res = await db.from('trip_events').update(movedDay ? { ...row, move_mode: null, move_min: null, move_note: null } : row).eq('id', f.id).select().single()
       if (res.error) return fail('일정 저장', res.error)
       Object.assign(old, res.data)
       if (f.place && f.category !== f.place.category) {
@@ -409,14 +411,22 @@ async function deletePlace() {
 const legForm = ref(null)
 function openLegForm(e) {
   const m = Number(e.move_min) || 0
-  legForm.value = { id: e.id, from: e.prev.title, to: e.title, mode: e.move_mode || 'walk', h: m >= 60 ? Math.floor(m / 60) : '', m: m ? m % 60 : '' }
+  legForm.value = { id: e.id, from: e.prev.title, to: e.title, mode: e.move_mode || 'walk', h: m >= 60 ? Math.floor(m / 60) : '', m: m ? m % 60 : '', note: e.move_note || '' }
+}
+// 구간 글자: 아이콘 이동 방법 · 설명 · 시간. 기타는 설명이 있으면 '기타' 대신 설명을 쓴다
+function legText(e) {
+  const m = MOVES[e.move_mode]
+  const note = e.move_note?.trim()
+  const head = e.move_mode === 'etc' && note ? `${m.icon} ${note}` : `${m.icon} ${m.label}${note ? ' · ' + note : ''}`
+  if (!e.move_min) return head
+  return head + (note ? ' · ' : ' ') + minLabel(e.move_min)
 }
 // 시간·분 두 칸을 분으로 합친다. 분 칸에 80을 넣어도 1시간 20분이 된다.
 const legTotal = (f) => (Number(f.h) || 0) * 60 + (Number(f.m) || 0)
 async function saveLeg(clear) {
   const f = legForm.value
   const total = legTotal(f)
-  const row = clear ? { move_mode: null, move_min: null } : { move_mode: f.mode, move_min: total > 0 ? total : null }
+  const row = clear ? { move_mode: null, move_min: null, move_note: null } : { move_mode: f.mode, move_min: total > 0 ? total : null, move_note: f.note.trim() || null }
   const { error } = await db.from('trip_events').update(row).eq('id', f.id)
   if (error) return fail('이동 방법 저장', error)
   Object.assign(events.value.find(x => x.id === f.id), row)
@@ -525,9 +535,9 @@ async function onDragEnd() {
   list.forEach((x, i) => {
     const prevNow = i > 0 ? list[i - 1].id : null
     const prevThen = before.indexOf(x.id) > 0 ? before[before.indexOf(x.id) - 1] : null
-    if (prevNow !== prevThen && (x.move_mode || x.move_min)) {
-      x.move_mode = null; x.move_min = null
-      clears.push(db.from('trip_events').update({ move_mode: null, move_min: null }).eq('id', x.id))
+    if (prevNow !== prevThen && (x.move_mode || x.move_min || x.move_note)) {
+      x.move_mode = null; x.move_min = null; x.move_note = null
+      clears.push(db.from('trip_events').update({ move_mode: null, move_min: null, move_note: null }).eq('id', x.id))
     }
   })
   await Promise.all(clears)
@@ -1079,11 +1089,11 @@ onUnmounted(() => {
             <div v-if="e.prev && !drag" class="leg" :class="{ empty: !e.move_mode, focus: e.id === legFocus }"
                  role="button" tabindex="0" title="지도에서 이 구간 보기" @click="focusLeg(e)" @keyup.enter="focusLeg(e)">
               <span class="leg-txt">
-                <template v-if="e.move_mode">{{ MOVES[e.move_mode].icon }} {{ MOVES[e.move_mode].label + (e.move_min ? ' ' + minLabel(e.move_min) : '') }}</template>
+                <template v-if="e.move_mode">{{ legText(e) }}</template>
                 <template v-else>이동 방법 미정</template>
               </span>
               <button class="leg-edit" :title="e.move_mode ? '이동 방법 고치기' : '이동 방법 넣기'" @click.stop="openLegForm(e)">✎</button>
-              <a v-if="e.place && e.prev.place_id" class="leg-go" :href="legUrl(e)" target="_blank" rel="noopener" @click.stop>경로 ↗</a>
+              <a v-if="e.place && e.prev.place_id && e.move_mode !== 'flight'" class="leg-go" :href="legUrl(e)" target="_blank" rel="noopener" @click.stop>경로 ↗</a>
             </div>
             <div data-row class="row" :class="{ sel: e.id === selId, warn: e.warn, dragging: drag && drag.id === e.id }"
                  :style="drag && drag.id === e.id ? { transform: `translateY(${drag.dy}px)` } : null"
@@ -1264,6 +1274,8 @@ onUnmounted(() => {
         <div class="chips">
           <button v-for="(m, k) in MOVES" :key="k" :class="{ on: legForm.mode === k }" style="--c:#16263d" @click="legForm.mode = k">{{ m.icon }} {{ m.label }}</button>
         </div>
+        <div class="f-lab">설명 (선택)</div>
+        <input v-model="legForm.note" class="f-in" style="margin-top:-6px" maxlength="40" :placeholder="MOVES[legForm.mode].hint" aria-label="구간 설명" />
         <div class="f-lab">걸리는 시간 (선택)</div>
         <div class="f-row" style="align-items:center;margin-top:-6px">
           <input v-model="legForm.h" type="number" inputmode="numeric" min="0" class="f-in" placeholder="0" aria-label="시간" /><span class="unit">시간</span>
@@ -1465,11 +1477,13 @@ button { font: inherit; color: inherit; }
 .r-warn { grid-column: 3 / -1; font-size: 11px; color: var(--red); background: var(--red-soft); border-radius: 6px; padding: 3px 7px; }
 .leg { display: flex; align-items: center; gap: 4px; width: 100%; padding: 3px 0 3px 76px; font-size: 12px; color: var(--sub); cursor: pointer; min-height: 30px; border-radius: 8px; }
 .leg:hover { background: rgba(15,124,140,.06); }
+.leg-txt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .leg.empty { color: var(--faint); }
 .leg.focus { color: #7a5200; background: var(--sun-soft); }
 .leg-edit { border: none; background: none; color: var(--sub); font-size: 13px; padding: 3px 7px; border-radius: 6px; cursor: pointer; }
 .leg-edit:hover { background: #fff; color: var(--lagoon); }
-.leg-go { margin-left: auto; margin-right: 8px; font-size: 11px; color: var(--lagoon); font-weight: 700; text-decoration: none; }
+.leg-go { margin-left: auto; margin-right: 8px; font-size: 11px; color: var(--lagoon); font-weight: 700; text-decoration: none; white-space: nowrap; }
+.leg-edit, .leg-go { flex-shrink: 0; }   /* 설명이 길면 글자 쪽이 말줄임으로 줄어든다 */
 .unit { font-size: 13px; color: var(--sub); white-space: nowrap; }
 .drop-line { height: 3px; background: var(--lagoon); border-radius: 3px; margin: 3px 0; }
 .mini-btn { border: 1px solid var(--line); background: #fff; border-radius: 9px; padding: 6px 10px; font-size: 12px; cursor: pointer; }

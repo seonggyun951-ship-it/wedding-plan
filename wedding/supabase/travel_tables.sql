@@ -95,8 +95,11 @@ create policy "user own trip_packing"  on trip_packing  for all using (auth.uid(
 -- 2026-11-13: 장소·일정 합치기 + 구간 이동 방법 (직접 고르기)
 -- 이동 방법·시간은 '앞 일정에서 이 일정으로 오는 구간'을 이 행에 적는다.
 alter table trip_events add column if not exists sort_order int;
-alter table trip_events add column if not exists move_mode  text;   -- walk / transit / taxi / car / etc
+alter table trip_events add column if not exists move_mode  text;   -- walk / transit / taxi / car / flight / etc
 alter table trip_events add column if not exists move_min   int;    -- 걸리는 시간(분)
 
 -- 2026-11-14: 웹 목록 표지 색 (TravelTab.vue COVERS 키). 비어 있으면 여행 id로 자동
 alter table trips add column if not exists cover text;
+
+-- 2026-11-14: 구간 설명 (예: 지하철 2호선, KE723, 페리)
+alter table trip_events add column if not exists move_note text;
