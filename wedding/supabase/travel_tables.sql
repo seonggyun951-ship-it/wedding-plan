@@ -97,3 +97,6 @@ create policy "user own trip_packing"  on trip_packing  for all using (auth.uid(
 alter table trip_events add column if not exists sort_order int;
 alter table trip_events add column if not exists move_mode  text;   -- walk / transit / taxi / car / etc
 alter table trip_events add column if not exists move_min   int;    -- 걸리는 시간(분)
+
+-- 2026-11-14: 웹 목록 표지 색 (TravelTab.vue COVERS 키). 비어 있으면 여행 id로 자동
+alter table trips add column if not exists cover text;

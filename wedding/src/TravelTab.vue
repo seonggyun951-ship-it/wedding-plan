@@ -10,6 +10,7 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 const props = defineProps({
   supabase: { type: Object, required: true },
   userId:   { type: String, required: true },
+  solo:     { type: Boolean, default: false },   // 여행 전용 계정: 웨딩 메뉴 없음
 })
 const emit = defineEmits(['logout', 'nav'])
 const db = props.supabase
@@ -48,12 +49,39 @@ const CURRENCIES = [
   { code:'CHF', name:'프랑',      sym:'CHF ' },
 ]
 const curOf = (code) => CURRENCIES.find(c => c.code === code) || { code, name: code, sym: code + ' ' }
-const PACK_TEMPLATES = {
-  기본:   { 서류: ['신분증', '예약 확인서'], 생활: ['칫솔·치약', '세면도구', '상비약', '속옷', '잠옷'], 전자기기: ['휴대폰 충전기', '보조배터리'] },
-  해외:   { 서류: ['여권 (만료일 확인)', '항공권 e티켓', '여행자 보험', '입국 신고 등록'], 돈: ['현지 통화', '해외결제 카드'], 전자기기: ['돼지코 어댑터', 'eSIM·유심'] },
-  휴양지: { 물놀이: ['수영복', '래시가드', '선크림', '선글라스', '방수팩', '아쿠아슈즈'], 생활: ['모자', '얇은 겉옷'] },
-  겨울:   { 옷: ['패딩', '목도리', '장갑', '내복'], 생활: ['핫팩', '립밤', '보습크림'] },
+// 준비물 + 를 누르면 나오는 예시. 하나씩 눌러 담는다 (분류 이름이 trip_packing.grp로 들어감)
+const PACK_EXAMPLES = {
+  '서류':      ['여권 (6개월 이상 남았는지)', '신분증', '항공권 e티켓', '숙소 예약 확인서', '여행자 보험', '비자·전자여행허가', '입국 신고 등록', '국제운전면허증', '렌터카 예약 확인서', '여권 사본·증명사진'],
+  '돈':        ['현지 통화', '해외결제 카드', '예비 카드 한 장', '동전 지갑', '원화 조금 (공항 오갈 때)'],
+  '전자기기':  ['휴대폰 충전기', '보조배터리', '돼지코·멀티 어댑터', 'eSIM·유심', '멀티탭', '이어폰', '스마트워치 충전기', '카메라·배터리·메모리', '셀카봉·삼각대', '충전 케이블 여분'],
+  '세면·화장': ['칫솔·치약', '샴푸·린스', '바디워시', '클렌징폼', '스킨·로션', '선크림', '화장품', '면도기', '빗', '렌즈·렌즈액', '생리용품', '액체류 지퍼백'],
+  '상비약':    ['소화제', '진통·해열제', '감기약', '지사제', '멀미약', '밴드', '상처 연고', '복용 중인 약', '모기 기피제'],
+  '옷':        ['속옷', '양말', '잠옷', '상의', '하의', '겉옷·가디건', '편한 신발', '슬리퍼', '모자'],
+  '기내·이동': ['목베개', '안대', '귀마개', '볼펜 (입국신고서)', '마스크', '얇은 담요', '기내용 작은 가방'],
+  '생활':      ['우산·우비', '선글라스', '휴대용 휴지', '물티슈', '손소독제', '지퍼백', '빨래용 비닐봉지', '접이식 장바구니', '손톱깎이', '텀블러', '캐리어 자물쇠'],
+  '물놀이':    ['수영복', '래시가드', '아쿠아슈즈', '방수팩', '비치타월', '스노클 마스크', '튜브', '애프터선 젤'],
+  '겨울':      ['패딩', '목도리', '장갑', '털모자', '내복', '핫팩', '립밤', '보습크림'],
+  '캠핑':      ['텐트', '그라운드 시트', '침낭', '에어매트', '랜턴·예비 배터리', '캠핑 의자', '테이블', '타프', '해머·팩·로프', '버너·가스', '코펠', '아이스박스', '장작·토치'],
+  '아이와 함께': ['기저귀', '아기 물티슈', '분유·젖병', '이유식', '유모차', '아기 상비약', '장난감·책'],
 }
+const PACK_CATS = ['전체', ...Object.keys(PACK_EXAMPLES)]
+// 웹 목록 표지 (파스텔). trips.cover에 키를 저장한다
+const COVERS = {
+  mint:     ['#cfe9e6', '#e8f4f1'], peach:  ['#fbe0c8', '#fdf0e2'], sky:   ['#d6e2f5', '#ecf2fb'],
+  lavender: ['#e8dcf0', '#f5eff8'], sage:   ['#dcecd2', '#eef6e8'], pink:  ['#f9d9e2', '#fdeef2'],
+  lemon:    ['#f7edc0', '#fcf7e0'], coral:  ['#f8d4cc', '#fdebe6'], sand:  ['#ebe0d0', '#f6f0e7'],
+  aqua:     ['#cdeef5', '#e9f8fb'], lilac:  ['#dcdcf7', '#efeffc'], stone: ['#dde3e8', '#eff2f4'],
+}
+const COVER_KEYS = Object.keys(COVERS)
+const TRIP_EMOJIS = ['✈️', '🌴', '🏖️', '🏝️', '🗼', '🏯', '⛩️', '🗽', '🎡', '🏔️', '⛰️', '🍊', '🚗', '🚄', '🛳️', '⛺', '🎿', '🌸', '🍜', '🍷', '💍', '❤️']
+// 색을 고르지 않은 여행은 id로 정해 늘 같은 색이 나오게 한다
+const coverKey = (t) => {
+  if (COVERS[t.cover]) return t.cover
+  let h = 0
+  for (const ch of String(t.id || t.title || '')) h = (h * 31 + ch.charCodeAt(0)) >>> 0
+  return COVER_KEYS[h % COVER_KEYS.length]
+}
+const coverBg = (t) => { const [a, b] = COVERS[coverKey(t)]; return `linear-gradient(135deg, ${a}, ${b})` }
 
 // ── 날짜 도우미 (모두 현지 날짜 문자열 'YYYY-MM-DD') ─────────
 const pad = (n) => String(n).padStart(2, '0')
@@ -121,6 +149,13 @@ const days = computed(() => tripDays(trip.value))
 const dayOf = (ymd) => days.value.find(d => d.ymd === ymd)
 const upcoming = computed(() => trips.value.filter(t => t.end_date >= todayYmd()).sort((a, b) => a.start_date.localeCompare(b.start_date)))
 const past     = computed(() => trips.value.filter(t => t.end_date <  todayYmd()).sort((a, b) => b.start_date.localeCompare(a.start_date)))
+// 웹: 지난 여행을 연도별로 (최근 연도가 위, 한 해 안에서는 날짜 순)
+const pastByYear = computed(() => {
+  const m = {}
+  for (const t of past.value) (m[t.start_date.slice(0, 4)] ||= []).push(t)
+  return Object.keys(m).sort((a, b) => b.localeCompare(a))
+    .map(y => ({ year: y, trips: m[y].sort((a, b) => a.start_date.localeCompare(b.start_date)) }))
+})
 const placeById = (id) => places.value.find(p => p.id === id) || null
 
 // ── 불러오기 ────────────────────────────────────────────────
@@ -180,11 +215,11 @@ function backToList() {
 
 // ── 여행 추가·수정·삭제 ─────────────────────────────────────
 const tripForm = ref(null)
-const blankTrip = () => ({ id: null, title: '', emoji: '✈️', origin_code: 'ICN', dest_code: '', start_date: todayYmd(), end_date: todayYmd(), budget: '', currency: 'KRW', fx_input: '' })
+const blankTrip = () => ({ id: null, title: '', emoji: '✈️', cover: COVER_KEYS[trips.value.length % COVER_KEYS.length], origin_code: 'ICN', dest_code: '', start_date: todayYmd(), end_date: todayYmd(), budget: '', currency: 'KRW', fx_input: '' })
 const fxUnit = (code) => curOf(code).per || 1
 function openTripForm(t) {
   if (!t) { tripForm.value = blankTrip(); return }
-  tripForm.value = { ...t, budget: t.budget || '', fx_input: t.fx_rate ? +(Number(t.fx_rate) * fxUnit(t.currency)).toFixed(4) : '' }
+  tripForm.value = { ...t, cover: coverKey(t), budget: t.budget || '', fx_input: t.fx_rate ? +(Number(t.fx_rate) * fxUnit(t.currency)).toFixed(4) : '' }
 }
 async function saveTrip() {
   const f = tripForm.value
@@ -192,7 +227,7 @@ async function saveTrip() {
   if (!f.start_date || !f.end_date) return alert('날짜를 골라 주세요')
   if (f.end_date < f.start_date) return alert('끝나는 날이 시작하는 날보다 빠릅니다')
   const row = {
-    title: f.title.trim(), emoji: f.emoji || '✈️',
+    title: f.title.trim(), emoji: f.emoji || '✈️', cover: f.cover || null,
     origin_code: (f.origin_code || '').trim().toUpperCase() || null,
     dest_code: (f.dest_code || '').trim().toUpperCase() || null,
     start_date: f.start_date, end_date: f.end_date,
@@ -396,6 +431,15 @@ function focusLeg(e) {
   if (isWide.value) mapHidden.value = false
   else mapOpen.value = true
 }
+// 일정 줄을 누르면 지도에서 그곳을 강조한다 (수정은 줄 옆 ✎). 위치가 있으면 휴대폰은 접힌 지도를 편다
+function selectItem(e) {
+  selId.value = e.id
+  mapAllDays.value = false
+  if (placeById(e.place_id)?.lat != null) {
+    if (isWide.value) mapHidden.value = false
+    else mapOpen.value = true
+  }
+}
 // 일정 줄을 고르거나 날을 바꾸면 구간 강조는 푼다
 watch(selId, (v) => { if (v) legFocus.value = '' })
 watch(dayYmd, () => { legFocus.value = '' })
@@ -429,15 +473,18 @@ function onGripDown(ev, e, index) {
   const st = scrollTopOf(scrollerOf())
   const rows = [...listEl.value.querySelectorAll('[data-row]')]
   const mids = rows.map(r => { const b = r.getBoundingClientRect(); return b.top + b.height / 2 + st })
-  drag.value = { id: e.id, from: index, over: index, dy: 0, startY: ev.clientY + st, mids, lastY: ev.clientY }
+  // top0: 목록 맨 위 위치. 끄는 동안 위쪽 화면(지도 등) 높이가 바뀌면 그만큼 빼서 잰다
+  drag.value = { id: e.id, from: index, over: index, dy: 0, startY: ev.clientY + st, mids, lastY: ev.clientY, top0: listEl.value.getBoundingClientRect().top + st }
   window.addEventListener('pointermove', onDragMove)
   window.addEventListener('pointerup', onDragEnd)
   window.addEventListener('pointercancel', onDragEnd)
   autoRaf = requestAnimationFrame(autoScroll)
 }
 function updateDrag() {
-  const d = drag.value; if (!d) return
-  const y = d.lastY + scrollTopOf(scrollerOf())
+  const d = drag.value; if (!d || !listEl.value) return
+  const st = scrollTopOf(scrollerOf())
+  const shift = listEl.value.getBoundingClientRect().top + st - d.top0
+  const y = d.lastY + st - shift
   d.dy = y - d.startY
   d.over = d.mids.filter((m, i) => i !== d.from && m < y).length
 }
@@ -457,10 +504,8 @@ function autoScroll() {
   let v = 0
   if (d.lastY < top) v = -Math.ceil((top - d.lastY) / 5)
   else if (d.lastY > bottom) v = Math.ceil((d.lastY - bottom) / 5)
-  if (v) {
-    if (s) s.scrollTop += v; else window.scrollBy(0, v)
-    updateDrag()
-  }
+  if (v) { if (s) s.scrollTop += v; else window.scrollBy(0, v) }
+  updateDrag()   // 스크롤하지 않아도 매 프레임 다시 잰다 (위쪽 높이가 바뀌는 경우)
   autoRaf = requestAnimationFrame(autoScroll)
 }
 async function onDragEnd() {
@@ -768,26 +813,32 @@ const packGroups = computed(() => {
   return groups
 })
 const daysToGo = computed(() => trip.value ? daysBetween(todayYmd(), trip.value.start_date) : 0)
-async function addTemplate(name) {
-  const have = packing.value.map(x => x.text)
-  const rows = []
-  Object.entries(PACK_TEMPLATES[name]).forEach(([grp, list]) => list.forEach(text => {
-    if (!have.includes(text)) rows.push({ grp, text, trip_id: tripId.value, user_id: props.userId })
-  }))
-  if (!rows.length) return alert(`'${name}' 템플릿 항목은 이미 다 들어 있습니다`)
-  const { data, error } = await db.from('trip_packing').insert(rows).select()
-  if (error) return fail('준비물 추가', error)
-  packing.value.push(...data)
-}
-const packForm = ref(null)
-function openPackForm() { packForm.value = { grp: packGroups.value[0]?.name || '기타', text: '' } }
-async function savePack() {
-  const f = packForm.value
-  if (!f.text.trim()) return
-  const { data, error } = await db.from('trip_packing').insert({ grp: f.grp.trim() || '기타', text: f.text.trim(), trip_id: tripId.value, user_id: props.userId }).select().single()
+const packForm = ref(null)        // { cat, text } — cat은 예시 분류 칩 ('전체' 포함)
+function openPackForm() { packForm.value = { cat: '전체', text: '' } }
+const packHas = (text) => packing.value.find(x => x.text === text)
+let packBusy = false              // 빠르게 두 번 눌러 같은 게 두 번 들어가지 않게
+async function addPack(grp, text) {
+  const { data, error } = await db.from('trip_packing').insert({ grp, text, trip_id: tripId.value, user_id: props.userId }).select().single()
   if (error) return fail('준비물 추가', error)
   packing.value.push(data)
-  packForm.value.text = ''
+}
+// 예시를 누르면 담고, 이미 담긴 걸 누르면 뺀다
+async function togglePackEx(grp, text) {
+  if (packBusy) return
+  packBusy = true
+  const have = packHas(text)
+  if (have) await deletePack(have)
+  else await addPack(grp, text)
+  packBusy = false
+}
+async function savePack() {
+  const f = packForm.value
+  const text = f.text.trim()
+  if (!text || packBusy) return
+  packBusy = true
+  await addPack(f.cat === '전체' ? '기타' : f.cat, text)
+  packBusy = false
+  f.text = ''
 }
 async function togglePack(x) {
   const done = !x.done
@@ -810,12 +861,33 @@ function onFab() {
 }
 const APP_TABS = [['home', '🏠 홈'], ['checklist', '✅ 체크리스트'], ['realestate', '🏠 부동산']]
 
+// ── 뒤로가기 ────────────────────────────────────────────────
+// 여행 화면·입력 창을 열 때 브라우저 기록을 하나씩 쌓아 둔다.
+// 뒤로가기: 입력 창 닫기 → 여행 목록 → (목록에선) 앱 밖으로
+const anySheet = computed(() => !!(tripForm.value || itemForm.value || legForm.value || placeForm.value || expForm.value || packForm.value))
+let histDepth = 0   // 지금 쌓아 둔 기록 수
+let skipPop = 0     // 화면 버튼으로 닫으며 기록을 되돌린 횟수 (그때 오는 popstate는 무시)
+watch([view, anySheet], () => {
+  const want = (view.value === 'detail' ? 1 : 0) + (anySheet.value ? 1 : 0)
+  while (histDepth < want) { history.pushState({ trv: histDepth + 1 }, ''); histDepth++ }
+  if (histDepth > want) { skipPop++; history.go(want - histDepth); histDepth = want }
+})
+function onPop() {
+  if (skipPop) { skipPop--; return }
+  if (!histDepth) return
+  histDepth--
+  if (anySheet.value) { tripForm.value = itemForm.value = legForm.value = placeForm.value = expForm.value = packForm.value = null }
+  else if (view.value === 'detail') backToList()
+}
+
 onMounted(() => {
   loadTrips()
   wideMq = window.matchMedia(WIDE_QUERY)
   wideMq.addEventListener('change', onWide)
+  window.addEventListener('popstate', onPop)
 })
 onUnmounted(() => {
+  window.removeEventListener('popstate', onPop)
   wideMq?.removeEventListener('change', onWide)
   window.removeEventListener('pointermove', onDragMove)
   window.removeEventListener('pointerup', onDragEnd)
@@ -825,7 +897,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="trv" :class="{ wide: isWide }">
+  <div class="trv" :class="{ wide: isWide, solo }">
     <!-- 헤더 -->
     <header class="trv-hdr">
       <template v-if="view === 'list'">
@@ -840,7 +912,7 @@ onUnmounted(() => {
           </div>
         </div>
       </template>
-      <nav v-if="isWide" class="trv-appnav">
+      <nav v-if="isWide && !solo" class="trv-appnav">
         <button v-for="[k, l] in APP_TABS" :key="k" @click="emit('nav', k)">{{ l }}</button>
         <button class="on">✈️ 여행</button>
       </nav>
@@ -855,6 +927,55 @@ onUnmounted(() => {
         <div style="font-size:34px">🧳</div>
         <p>아직 여행이 없습니다<br>+ 로 첫 여행을 만들어 보세요</p>
       </div>
+      <!-- 웹: 표지 카드 -->
+      <template v-else-if="isWide">
+        <div class="cv-top">
+          <div><h2>여행</h2><p>다가올 여행 {{ upcoming.length }} · 지난 여행 {{ past.length }}</p></div>
+          <button class="cv-new" @click="openTripForm(null)">+ 새 여행</button>
+        </div>
+        <template v-if="upcoming.length">
+          <p class="cv-sec">UPCOMING</p>
+          <div class="cv-grid">
+            <div v-for="t in upcoming" :key="t.id" class="cv" @click="openTrip(t)">
+              <div class="cv-cover" :style="{ background: coverBg(t) }">
+                <span class="cv-chip mono" :class="{ now: ddayOf(t).text === '여행 중' }">{{ ddayOf(t).text === '여행 중' ? '여행 중' : 'D' + ddayOf(t).text }}</span>
+                <span class="cv-emo">{{ t.emoji }}</span>
+                <div v-if="t.origin_code && t.dest_code" class="cv-rt mono">{{ t.origin_code }} <i>✈</i> {{ t.dest_code }}</div>
+                <div v-else class="cv-rt">{{ t.title }}</div>
+              </div>
+              <div class="cv-body">
+                <div class="cv-t">{{ t.emoji }} {{ t.title }}</div>
+                <div class="cv-d mono">{{ t.start_date.replaceAll('-', '.') }} – {{ mmdd(t.end_date) }} · {{ nightsLabel(t) }}</div>
+                <div v-if="t.budget" class="gauge"><i :style="{ width: Math.min(100, statOf(t.id).used / t.budget * 100) + '%' }"></i></div>
+                <div class="cv-st">
+                  <span v-if="t.budget">예산 <b class="mono">{{ Math.round(statOf(t.id).used / t.budget * 100) }}%</b></span>
+                  <span>일정 <b>{{ statOf(t.id).events }}</b></span>
+                  <span v-if="statOf(t.id).packAll">준비물 <b class="mono">{{ statOf(t.id).packDone }}/{{ statOf(t.id).packAll }}</b></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+        <template v-if="past.length">
+          <p class="cv-sec">PAST</p>
+          <template v-for="g in pastByYear" :key="g.year">
+            <div class="cv-yr mono">{{ g.year }}</div>
+            <div class="cv-grid past">
+              <div v-for="t in g.trips" :key="t.id" class="cv" @click="openTrip(t)">
+                <div class="cv-cover" :style="{ background: coverBg(t) }">
+                  <span class="cv-emo">{{ t.emoji }}</span>
+                  <div v-if="t.origin_code && t.dest_code" class="cv-rt mono">{{ t.origin_code }} <i>✈</i> {{ t.dest_code }}</div>
+                  <div v-else class="cv-rt">{{ t.title }}</div>
+                </div>
+                <div class="cv-body">
+                  <div class="cv-t">{{ t.emoji }} {{ t.title }}</div>
+                  <div class="cv-d mono">{{ mmdd(t.start_date) }} – {{ mmdd(t.end_date) }}</div>
+                </div>
+              </div>
+            </div>
+          </template>
+        </template>
+      </template>
       <template v-else>
         <p v-if="upcoming.length" class="trv-sec">UPCOMING</p>
         <div class="pass-grid">
@@ -966,7 +1087,7 @@ onUnmounted(() => {
             </div>
             <div data-row class="row" :class="{ sel: e.id === selId, warn: e.warn, dragging: drag && drag.id === e.id }"
                  :style="drag && drag.id === e.id ? { transform: `translateY(${drag.dy}px)` } : null"
-                 @click="selId = e.id; openItemForm(e)">
+                 @click="selectItem(e)">
               <span class="grip" title="끌어서 순서 바꾸기" @pointerdown.stop="onGripDown($event, e, i)" @click.stop>⋮⋮</span>
               <span class="r-t mono" :class="{ none: !e.start_time }">{{ e.start_time ? hhmm(e.start_time) : '—' }}</span>
               <span class="r-pin" :style="{ background: CATS[e.category]?.color }">{{ e.no }}</span>
@@ -976,7 +1097,10 @@ onUnmounted(() => {
                   <template v-if="e.end_time">~{{ hhmm(e.end_time) }}</template><template v-if="e.end_time && (e.memo || e.place?.address)"> · </template>{{ e.memo || (isWide ? e.place?.address : '') }}
                 </small>
               </span>
-              <a v-if="dirUrl(e.place)" class="r-go" :href="dirUrl(e.place)" target="_blank" rel="noopener" title="여기까지 길찾기" @click.stop>↗</a>
+              <span class="r-act">
+                <button class="r-edit" title="일정 고치기" @click.stop="openItemForm(e)">✎</button>
+                <a v-if="dirUrl(e.place)" class="r-go" :href="dirUrl(e.place)" target="_blank" rel="noopener" title="여기까지 길찾기" @click.stop>↗</a>
+              </span>
               <span v-if="e.warn" class="r-warn">{{ e.warn }}</span>
             </div>
           </template>
@@ -1042,8 +1166,7 @@ onUnmounted(() => {
             <div class="stamp-s">{{ daysToGo > 0 ? `출발까지 ${daysToGo}일` : daysToGo === 0 ? '오늘 출발' : '출발한 여행' }}</div>
           </div>
         </div>
-        <p class="trv-sec">템플릿 불러오기</p>
-        <div class="tpl"><button v-for="(v, k) in PACK_TEMPLATES" :key="k" @click="addTemplate(k)">+ {{ k }}</button></div>
+        <p v-if="!packing.length" class="pk-empty">아직 준비물이 없어요<br>+ 를 눌러 추가하세요</p>
         <template v-for="g in packGroups" :key="g.name">
           <div class="grp"><span>{{ g.name }}</span><span class="mono">{{ g.items.filter(x => x.done).length }}/{{ g.items.length }}</span></div>
           <div v-for="x in g.items" :key="x.id" class="ck" :class="{ done: x.done }" @click="togglePack(x)">
@@ -1054,15 +1177,27 @@ onUnmounted(() => {
       </section>
     </div>
 
-    <button class="trv-fab" @click="onFab" :title="view === 'list' ? '새 여행' : '추가'">+</button>
+    <button v-if="!(isWide && view === 'list' && trips.length)" class="trv-fab" @click="onFab" :title="view === 'list' ? '새 여행' : '추가'">+</button>
 
     <!-- 여행 추가·수정 -->
     <div v-if="tripForm" class="sheet-bg" @click.self="tripForm = null">
       <div class="sheet">
         <h3>{{ tripForm.id ? '여행 설정' : '새 여행' }}</h3>
+        <div class="cv-prev" :style="{ background: coverBg(tripForm) }">
+          <span class="cv-emo">{{ tripForm.emoji }}</span>
+          <div class="cv-rt">{{ tripForm.title || '여행 이름' }}</div>
+        </div>
         <div class="f-row">
-          <input v-model="tripForm.emoji" class="f-in" style="width:56px;text-align:center" maxlength="4" />
+          <input v-model="tripForm.emoji" class="f-in" style="width:56px;text-align:center" maxlength="4" title="직접 입력해도 됩니다" />
           <input v-model="tripForm.title" class="f-in" placeholder="여행 이름 (예: 신혼여행 · 하와이)" />
+        </div>
+        <div class="emo-pick">
+          <button v-for="e in TRIP_EMOJIS" :key="e" type="button" :class="{ on: tripForm.emoji === e }" @click="tripForm.emoji = e">{{ e }}</button>
+        </div>
+        <div class="f-lab">표지 색
+          <div class="cover-pick">
+            <button v-for="k in COVER_KEYS" :key="k" type="button" :class="{ on: tripForm.cover === k }" :style="{ background: `linear-gradient(135deg, ${COVERS[k][0]}, ${COVERS[k][1]})` }" @click="tripForm.cover = k" :aria-label="k"></button>
+          </div>
         </div>
         <div class="f-row">
           <label class="f-lab">출발 공항<input v-model="tripForm.origin_code" class="f-in mono" maxlength="3" placeholder="ICN" /></label>
@@ -1188,15 +1323,26 @@ onUnmounted(() => {
 
     <!-- 준비물 추가 -->
     <div v-if="packForm" class="sheet-bg" @click.self="packForm = null">
-      <div class="sheet">
-        <h3>준비물 추가</h3>
-        <input v-model="packForm.grp" class="f-in" placeholder="분류 (예: 서류)" list="trv-pack-groups" />
-        <datalist id="trv-pack-groups"><option v-for="g in packGroups" :key="g.name" :value="g.name" /></datalist>
-        <input v-model="packForm.text" class="f-in" placeholder="챙길 것" @keyup.enter="savePack" />
-        <div class="f-act">
-          <button class="f-cancel" @click="packForm = null">닫기</button>
-          <button class="f-ok" :disabled="!packForm.text.trim()" @click="savePack">추가</button>
+      <div class="sheet pk-sheet">
+        <h3 class="pk-h">준비물 추가 <small>{{ packing.length }}개 담김</small></h3>
+        <div class="f-row">
+          <input v-model="packForm.text" class="f-in" placeholder="직접 입력 (예: 카메라 렌즈)" @keyup.enter="savePack" />
+          <button class="pk-add" :disabled="!packForm.text.trim()" @click="savePack">추가</button>
         </div>
+        <div class="pk-cats">
+          <button v-for="c in PACK_CATS" :key="c" :class="{ on: packForm.cat === c }" @click="packForm.cat = c">{{ c }}</button>
+        </div>
+        <div class="pk-list">
+          <template v-for="(list, g) in PACK_EXAMPLES" :key="g">
+            <template v-if="packForm.cat === '전체' || packForm.cat === g">
+              <div class="pk-lg">{{ g }}</div>
+              <div class="pk-chips">
+                <button v-for="t in list" :key="t" :class="{ on: packHas(t) }" @click="togglePackEx(g, t)">{{ t }}</button>
+              </div>
+            </template>
+          </template>
+        </div>
+        <button class="pk-done" @click="packForm = null">다 골랐어요</button>
       </div>
     </div>
   </div>
@@ -1312,6 +1458,9 @@ button { font: inherit; color: inherit; }
 .r-nm { min-width: 0; }
 .r-nm b { display: block; font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .r-nm small { display: block; font-size: 11px; color: var(--sub); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.r-act { display: flex; align-items: center; gap: 2px; }
+.r-edit { border: none; background: none; color: var(--sub); font-size: 14px; padding: 4px 7px; border-radius: 7px; cursor: pointer; }
+.r-edit:hover { background: var(--lagoon-soft); color: var(--lagoon); }
 .r-go { color: var(--lagoon); font-weight: 700; text-decoration: none; padding: 4px 6px; }
 .r-warn { grid-column: 3 / -1; font-size: 11px; color: var(--red); background: var(--red-soft); border-radius: 6px; padding: 3px 7px; }
 .leg { display: flex; align-items: center; gap: 4px; width: 100%; padding: 3px 0 3px 76px; font-size: 12px; color: var(--sub); cursor: pointer; min-height: 30px; border-radius: 8px; }
@@ -1356,8 +1505,22 @@ button { font: inherit; color: inherit; }
 .ring { width: 46px; height: 46px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
 .ring span { width: 36px; height: 36px; border-radius: 50%; background: #fff; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; }
 .stamp-t { font-weight: 700; font-size: 14px; } .stamp-s { font-size: 12px; color: var(--sub); }
-.tpl { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
-.tpl button { font-size: 12px; background: #fff; border: 1px solid var(--line); border-radius: 20px; padding: 6px 12px; cursor: pointer; }
+.pk-empty { text-align: center; color: var(--sub); font-size: 13px; line-height: 1.7; padding: 30px 0; }
+.pk-sheet { overflow: hidden; }
+.pk-h { display: flex; justify-content: space-between; align-items: center; }
+.pk-h small { font-size: 12px; color: var(--lagoon); font-weight: 700; }
+.pk-add { border: none; background: var(--lagoon); color: #fff !important; border-radius: 10px; padding: 0 14px; font-weight: 700; font-size: 14px; cursor: pointer; flex-shrink: 0; }
+.pk-add:disabled { opacity: .5; }
+.pk-cats { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; flex-shrink: 0; }
+.pk-cats button { flex-shrink: 0; border: 1px solid var(--line); background: #fff; border-radius: 20px; padding: 6px 12px; font-size: 12px; color: var(--sub); cursor: pointer; }
+.pk-cats button.on { background: var(--ink); border-color: var(--ink); color: #fff; font-weight: 700; }
+.pk-list { overflow-y: auto; min-height: 0; flex: 1; }
+.pk-lg { font-size: 11px; font-weight: 700; color: var(--sub); letter-spacing: 1px; margin: 10px 2px 6px; }
+.pk-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.pk-chips button { border: 1px solid var(--line); background: #f8fafb; border-radius: 20px; padding: 7px 12px; font-size: 13px; color: var(--ink); cursor: pointer; }
+.pk-chips button.on { background: var(--lagoon-soft); border-color: var(--lagoon); color: var(--lagoon); font-weight: 700; }
+.pk-chips button.on::before { content: "✓ "; }
+.pk-done { border: none; background: var(--ink); color: #fff !important; border-radius: 12px; padding: 13px; font-weight: 700; font-size: 15px; flex-shrink: 0; cursor: pointer; }
 .grp { font-size: 11px; font-weight: 700; color: var(--sub); letter-spacing: 1px; display: flex; justify-content: space-between; margin: 14px 2px 6px; }
 .ck { background: #fff; border-radius: 10px; padding: 11px 12px; display: flex; align-items: center; gap: 10px; margin-bottom: 5px; font-size: 14px; cursor: pointer; }
 .box { width: 18px; height: 18px; border-radius: 50%; border: 2px solid #c6d1d9; flex-shrink: 0; }
@@ -1369,8 +1532,51 @@ button { font: inherit; color: inherit; }
 .trv.wide { position: fixed; inset: 0; z-index: 150; overflow: hidden; display: flex; flex-direction: column; }
 .trv.wide .trv-hdr { position: static; transform: none; max-width: none; left: auto; flex-shrink: 0; padding: 0 20px; }
 .trv.wide .trv-fab { bottom: 24px; right: 24px; }
-.trv.wide .list-body { flex: 1; overflow: auto; padding: 24px 24px 100px; }
-.trv.wide .list-body > * { max-width: 920px; margin-left: auto; margin-right: auto; }
+/* 여행 전용 계정: 아래 메뉴가 없으니 + 버튼·여백을 내린다 */
+.trv.solo:not(.wide) .trv-fab { bottom: calc(20px + env(safe-area-inset-bottom, 0px)); }
+.trv.solo:not(.wide) .trv-body { padding-bottom: 96px; }
+.trv.wide .list-body { flex: 1; overflow: auto; padding: 36px 32px 100px; }
+.trv.wide .list-body > * { max-width: 1120px; margin-left: auto; margin-right: auto; }
+/* 웹 목록: 표지 카드 */
+.cv-top { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 22px; }
+.cv-top h2 { font-size: 26px; margin: 0; }
+.cv-top p { margin: 4px 0 0; color: var(--sub); font-size: 14px; }
+.cv-new { background: var(--lagoon); color: #fff !important; border: none; border-radius: 12px; padding: 11px 18px; font-size: 14px; font-weight: 700; cursor: pointer; box-shadow: 0 4px 12px rgba(15,124,140,.3); }
+.cv-sec { font-size: 13px; font-weight: 700; color: var(--sub); letter-spacing: 1.6px; margin-top: 0; margin-bottom: 14px; display: flex; align-items: center; gap: 10px; }
+.cv-sec::after, .cv-yr::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.cv-yr { display: flex; align-items: center; gap: 12px; font-size: 18px; font-weight: 700; opacity: .75; margin-bottom: 12px; }
+.cv-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 40px; }
+.cv { background: #fff; border-radius: 16px; overflow: hidden; box-shadow: 0 2px 10px rgba(22,38,61,.07); cursor: pointer; transition: transform .15s, box-shadow .15s; }
+.cv:hover { transform: translateY(-3px); box-shadow: 0 12px 28px rgba(22,38,61,.13); }
+.cv-cover, .cv-prev { height: 150px; position: relative; color: var(--ink); padding: 16px 18px; display: flex; flex-direction: column; justify-content: flex-end; overflow: hidden; }
+.cv-emo { position: absolute; right: -8px; bottom: -22px; font-size: 120px; line-height: 1; opacity: .5; pointer-events: none; }
+.cv-rt { position: relative; font-size: 24px; font-weight: 800; letter-spacing: 2px; display: flex; align-items: center; gap: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cv-rt i { font-style: normal; font-size: 15px; opacity: .7; }
+.cv-chip { position: absolute; top: 14px; left: 16px; background: #fff; border-radius: 999px; padding: 5px 11px; font-size: 13px; font-weight: 800; box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+.cv-chip.now { background: var(--sun); color: #fff; }
+.cv-body { padding: 16px 18px 18px; }
+.cv-t { font-size: 18px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cv-d { font-size: 13px; color: var(--sub); margin-top: 4px; }
+.cv-body .gauge { height: 5px; margin-top: 14px; }
+.cv-st { display: flex; gap: 16px; margin-top: 12px; font-size: 13px; color: var(--sub); }
+.cv-st b { color: var(--ink); }
+.cv-grid.past { grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 22px; }
+.cv-grid.past .cv { opacity: .75; }
+.cv-grid.past .cv-cover { height: 84px; padding: 12px 14px; filter: grayscale(.55); }
+.cv-grid.past .cv-rt { font-size: 17px; }
+.cv-grid.past .cv-emo { font-size: 70px; bottom: -14px; }
+.cv-grid.past .cv-body { padding: 12px 14px 14px; }
+.cv-grid.past .cv-t { font-size: 15px; }
+/* 여행 설정: 표지 미리보기·이모지·색 고르기 */
+.cv-prev { height: 96px; border-radius: 14px; padding: 12px 16px; flex-shrink: 0; }
+.cv-prev .cv-emo { font-size: 84px; bottom: -16px; }
+.cv-prev .cv-rt { font-size: 18px; letter-spacing: 0; }
+.emo-pick { display: grid; grid-template-columns: repeat(auto-fill, minmax(34px, 1fr)); gap: 4px; }
+.emo-pick button { border: 1px solid transparent; background: #f3f6f8; border-radius: 9px; font-size: 18px; height: 36px; padding: 0; cursor: pointer; }
+.emo-pick button.on { border-color: var(--lagoon); background: var(--lagoon-soft); }
+.cover-pick { display: flex; flex-wrap: wrap; gap: 6px; }
+.cover-pick button { width: 30px; height: 30px; border-radius: 50%; border: 1px solid rgba(22,38,61,.08); cursor: pointer; padding: 0; }
+.cover-pick button.on { outline: 2px solid var(--lagoon); outline-offset: 2px; }
 .trv.wide .pass-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .trv.wide .pass-grid .pass { margin-bottom: 0; }
 .trv.wide .detail { flex: 1; min-height: 0; padding: 0; display: grid; grid-template-columns: 210px minmax(380px, 460px) 1fr; }

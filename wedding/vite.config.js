@@ -12,5 +12,14 @@ export default defineConfig({
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url))
     }
+  },
+  // 여행 앱 주소(/wedding-plan/travel/)도 실제 파일로 만들어 새로고침해도 열리게 한다
+  build: {
+    rollupOptions: {
+      input: {
+        main:   fileURLToPath(new URL('./index.html', import.meta.url)),
+        travel: fileURLToPath(new URL('./travel/index.html', import.meta.url)),
+      }
+    }
   }
 })

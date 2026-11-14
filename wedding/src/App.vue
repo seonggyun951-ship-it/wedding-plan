@@ -17,6 +17,11 @@ const inputEmail    = ref('')
 const inputPassword = ref('')
 const loginError    = ref('')
 const currentUserId = ref('')
+const travelOnly    = ref(false)   // auth.users의 app_metadata.travel_only (관리자만 바꿀 수 있음)
+// 여행 앱 주소(/wedding-plan/travel/)로 열었는지. 여행 전용 계정은 이 주소로만 들어올 수 있다
+const TRAVEL_URL   = import.meta.env.BASE_URL + 'travel/'
+const onTravelPath = location.pathname.replace(/\/+$/, '').endsWith('/travel')
+const loginToTravel = ref(false)
 const EDGE_FUNCTION_URL = 'https://wqahhqssawaxynqigwtr.supabase.co/functions/v1/smooth-action'
 
 // ── 데이터 ──────────────────────────────────────────────────
@@ -57,21 +62,52 @@ const setToast = (s) => {
 // ── 로그인 ──────────────────────────────────────────────────
 const login = async () => {
   loginError.value = ''
+  loginToTravel.value = false
   const { data, error } = await supabase.auth.signInWithPassword({
     email: inputEmail.value.trim(),
     password: inputPassword.value
   })
   if (error) { loginError.value = '아이디 또는 비밀번호가 틀렸습니다.'; return }
-  currentUserId.value = data.user.id
+  await enter(data.user)
+}
+
+// 로그인·새로고침 공통: 계정에 맞는 화면으로 들어간다
+const enter = async (user) => {
+  // 계정을 여럿이 같이 쓰므로 로그아웃은 이 기기만 (기본값 global은 같은 계정의 모든 기기를 끊는다)
+  if (user.app_metadata?.travel_only === true && !onTravelPath) {
+    await supabase.auth.signOut({ scope: 'local' })
+    loginError.value = '이 계정은 여행 앱 주소에서만 들어갈 수 있습니다.'
+    loginToTravel.value = true
+    return
+  }
+  currentUserId.value = user.id
+  travelOnly.value = user.app_metadata?.travel_only === true
   isAuthorized.value = true
+  if (onTravelPath) tab.value = 'travel'
+  if (travelOnly.value) { loading.value = false; return }
   await fetchAll()
 }
 
+// 새로고침해도 로그인 유지: 브라우저에 저장된 로그인이 있으면 들어간다.
+// 여행 전용 여부는 저장된 값 말고 서버에 다시 물어서 정한다 (getUser)
+const restoring = ref(true)
+const restore = async () => {
+  const { data: { session } } = await supabase.auth.getSession()
+  if (session) {
+    const { data, error } = await supabase.auth.getUser()
+    if (!error && data.user) await enter(data.user)
+  }
+  restoring.value = false
+}
+restore()
+
 const logout = async () => {
   if (!confirm('로그아웃 하시겠어요?')) return
-  await supabase.auth.signOut()
+  await supabase.auth.signOut({ scope: 'local' })
   isAuthorized.value = false
   currentUserId.value = ''
+  travelOnly.value = false
+  tab.value = 'home'
   inputEmail.value = ''
   inputPassword.value = ''
   categories.value = []
@@ -351,14 +387,20 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
 
 <template>
   <div class="app">
+    <!-- 저장된 로그인 확인 중 (로그인 화면이 깜빡이지 않게) -->
+    <div v-if="restoring" class="loading-screen">
+      <div class="spinner"></div><p>불러오는 중...</p>
+    </div>
+
     <!-- 로그인 -->
-    <div v-if="!isAuthorized" class="login-screen">
+    <div v-else-if="!isAuthorized" class="login-screen">
       <div class="login-box">
-        <div class="login-icon">💍</div>
-        <h2>우리만의 결혼 준비</h2>
+        <div class="login-icon">{{ onTravelPath ? '✈️' : '💍' }}</div>
+        <h2>{{ onTravelPath ? '여행' : '우리만의 결혼 준비' }}</h2>
         <input v-model="inputEmail" type="text" placeholder="아이디" @keyup.enter="login" class="pw-input" style="margin-bottom:10px" />
         <input v-model="inputPassword" type="password" placeholder="비밀번호" @keyup.enter="login" class="pw-input" />
         <div v-if="loginError" style="color:#ef4444;font-size:13px;margin-top:8px">{{ loginError }}</div>
+        <a v-if="loginToTravel" :href="TRAVEL_URL" style="display:inline-block;margin-top:8px;font-size:13px;color:#0f7c8c">여행 앱으로 가기 →</a>
         <button @click="login" class="btn-primary" style="margin-top:16px">입장하기</button>
       </div>
     </div>
@@ -370,7 +412,7 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
 
       <template v-else>
         <!-- 여행 탭: 헤더·화면·버튼을 따로 갖는다 -->
-        <TravelTab v-if="tab==='travel'" :supabase="supabase" :user-id="currentUserId" @logout="logout" @nav="t => tab = t" />
+        <TravelTab v-if="tab==='travel'" :supabase="supabase" :user-id="currentUserId" :solo="travelOnly" @logout="logout" @nav="t => tab = t" />
 
         <!-- 헤더 -->
         <header v-if="tab!=='travel'" class="app-header">
@@ -623,7 +665,7 @@ const diff = (a,b) => Number(a||0)-Number(b||0)
         </template>
 
         <!-- 하단 내비 -->
-        <nav class="bottom-nav">
+        <nav v-if="!travelOnly" class="bottom-nav">
           <button class="nav-btn" :class="{ active: tab==='home' }" @click="tab='home'">
             <span class="nav-icon">🏠</span><span class="nav-label">홈</span>
           </button>
