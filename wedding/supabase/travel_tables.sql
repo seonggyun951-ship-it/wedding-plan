@@ -103,3 +103,10 @@ alter table trips add column if not exists cover text;
 
 -- 2026-11-14: 구간 설명 (예: 지하철 2호선, KE723, 페리)
 alter table trip_events add column if not exists move_note text;
+
+-- 2026-11-14: 경비 — 같이 가는 사람·공금·예정·정산
+alter table trips         add column if not exists members    jsonb default '[]'::jsonb;  -- [{id, name}] 이름을 바꿔도 지출 기록이 안 깨지게 id로 가리킴
+alter table trip_expenses add column if not exists kind       text default 'spend';       -- spend(지출) / deposit(공금 넣기)
+alter table trip_expenses add column if not exists planned    boolean default false;      -- 예정 (아직 안 냄). 정산에서 뺀다
+alter table trip_expenses add column if not exists paid_by    text;                       -- 낸 사람 members.id / 'pot'(공금) / null(정하지 않음)
+alter table trip_expenses add column if not exists split_with jsonb;                      -- 나눌 사람 members.id 목록. null이면 모두

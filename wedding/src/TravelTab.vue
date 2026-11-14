@@ -170,7 +170,7 @@ async function loadTrips() {
     db.from('trip_events').select('trip_id'),
     db.from('trip_places').select('trip_id'),
     db.from('trip_packing').select('trip_id, done'),
-    db.from('trip_expenses').select('trip_id, amount_krw'),
+    db.from('trip_expenses').select('trip_id, amount_krw, kind, planned'),
   ])
   const err = t.error || e.error || p.error || k.error || x.error
   if (err) { loading.value = false; return fail('여행 불러오기', err) }
@@ -180,7 +180,8 @@ async function loadTrips() {
   e.data.forEach(r => at(r.trip_id).events++)
   p.data.forEach(r => at(r.trip_id).places++)
   k.data.forEach(r => { at(r.trip_id).packAll++; if (r.done) at(r.trip_id).packDone++ })
-  x.data.forEach(r => { at(r.trip_id).used += Number(r.amount_krw) || 0 })
+  // 목록 카드의 '쓴 돈'은 낸 지출만 (공금 넣은 돈·예정은 뺀다)
+  x.data.forEach(r => { if ((r.kind || 'spend') === 'spend' && !r.planned) at(r.trip_id).used += Number(r.amount_krw) || 0 })
   stats.value = s
   loading.value = false
 }
@@ -317,13 +318,61 @@ async function insertEvent(row, at) {
 
 // 일정 추가·수정 창
 const itemForm = ref(null)
+// place: 창에 보이는 장소 (새로 고른 건 아직 DB에 없어 id 없음), oldPlace: 열 때 장소, placeEdited: 바꾸기·빼기를 했는지
 function openItemForm(e) {
+  formQuery.value = ''; formSugg.value = []
   if (e) {
     const p = placeById(e.place_id)
-    itemForm.value = { ...e, start_time: hhmm(e.start_time), end_time: hhmm(e.end_time), place: p }
+    itemForm.value = { ...e, start_time: hhmm(e.start_time), end_time: hhmm(e.end_time), place: p, oldPlace: p, placeEdited: false, picking: false }
   } else {
-    itemForm.value = { id: null, day_date: dayYmd.value || days.value[0]?.ymd, start_time: '', end_time: '', title: '', category: 'spot', memo: '', place: null }
+    itemForm.value = { id: null, day_date: dayYmd.value || days.value[0]?.ymd, start_time: '', end_time: '', title: '', category: 'spot', memo: '', place: null, oldPlace: null, placeEdited: false, picking: false }
   }
+}
+// 일정 고치기 창의 장소 검색 (저장을 눌러야 적용)
+const formQuery = ref('')
+const formSugg = ref([])
+const formSearching = ref(false)
+let formTimer = null
+watch(formQuery, (q) => {
+  clearTimeout(formTimer)
+  if (!MAPS_KEY || q.trim().length < 2) { formSugg.value = []; return }
+  formTimer = setTimeout(() => searchFormPlaces(q.trim()), 300)
+})
+async function searchFormPlaces(q) {
+  try {
+    formSearching.value = true
+    const list = await fetchSuggestions(q)
+    if (formQuery.value.trim() !== q) return
+    formSugg.value = list
+  } catch (e) {
+    alert(`장소 검색 실패: ${e.message || e}`)
+    formSugg.value = []
+  } finally {
+    formSearching.value = false
+  }
+}
+async function pickFormPlace(s) {
+  const f = itemForm.value
+  busy.value = true
+  try {
+    const row = await placeRowOf(s)
+    // 이름이 비었거나 예전 장소 이름 그대로면 새 장소 이름·종류로 바꾼다 (직접 고친 이름은 둔다)
+    const t = f.title.trim()
+    if (!t || (f.place && t === f.place.name)) { f.title = row.name; f.category = row.category }
+    f.place = row
+    f.placeEdited = true
+    f.picking = false
+  } catch (e) {
+    alert(`장소 정보를 받지 못했습니다: ${e.message || e}`)
+  } finally {
+    sessionToken = null
+    formQuery.value = ''; formSugg.value = []
+    busy.value = false
+  }
+}
+function removeFormPlace() {
+  const f = itemForm.value
+  f.place = null; f.placeEdited = true; f.picking = false
 }
 async function saveItem() {
   const f = itemForm.value
@@ -332,6 +381,15 @@ async function saveItem() {
   const row = { day_date: f.day_date, start_time: f.start_time || null, end_time: f.end_time || null, title: f.title.trim(), category: f.category, memo: f.memo?.trim() || null }
   busy.value = true
   try {
+    if (f.placeEdited) {
+      // 새로 고른 장소는 저장할 때 DB에 넣는다 (취소하면 아무것도 안 남게)
+      if (f.place && !f.place.id) {
+        const p = await addPlace({ ...f.place, category: f.category })
+        if (!p) return
+        f.place = p
+      }
+      row.place_id = f.place?.id ?? null
+    }
     if (!f.id) {
       const made = await insertEvent(row)
       if (made) { dayYmd.value = made.day_date; selId.value = made.id }
@@ -344,6 +402,13 @@ async function saveItem() {
       if (f.place && f.category !== f.place.category) {
         await db.from('trip_places').update({ category: f.category }).eq('id', f.place.id)
         f.place.category = f.category
+      }
+      // 바꾸기·빼기로 떨어진 예전 장소는 다른 일정에서 안 쓰면 지운다 (일정 삭제할 때와 같음)
+      const op = f.oldPlace
+      if (f.placeEdited && op && op.id !== f.place?.id && !events.value.some(x => x.place_id === op.id)) {
+        const r = await db.from('trip_places').delete().eq('id', op.id)
+        if (r.error) fail('장소 삭제', r.error)
+        else places.value = places.value.filter(p => p.id !== op.id)
       }
       if (movedDay) {
         // 다른 날로 옮기면 그날 끝(또는 시간 자리)으로 보내고 두 날 순서를 다시 매긴다
@@ -369,15 +434,16 @@ async function itemToTray() {
 }
 async function deleteItem() {
   const f = itemForm.value
-  if (!confirm(`'${f.title}' 일정을 삭제할까요?${f.place ? '\n담아 둔 장소 정보도 함께 지워집니다.' : ''}`)) return
+  const op = f.oldPlace   // DB에 실제로 연결된 장소 (창에서 바꾸기만 하고 저장 안 한 건 상관없음)
+  if (!confirm(`'${f.title}' 일정을 삭제할까요?${op ? '\n담아 둔 장소 정보도 함께 지워집니다.' : ''}`)) return
   const day = events.value.find(x => x.id === f.id)?.day_date
   const { error } = await db.from('trip_events').delete().eq('id', f.id)
   if (error) return fail('일정 삭제', error)
   events.value = events.value.filter(x => x.id !== f.id)
-  if (f.place && !events.value.some(x => x.place_id === f.place.id)) {
-    const r = await db.from('trip_places').delete().eq('id', f.place.id)
+  if (op && !events.value.some(x => x.place_id === op.id)) {
+    const r = await db.from('trip_places').delete().eq('id', op.id)
     if (r.error) fail('장소 삭제', r.error)
-    else places.value = places.value.filter(p => p.id !== f.place.id)
+    else places.value = places.value.filter(p => p.id !== op.id)
   }
   await saveOrder(itemsOf(day))
   itemForm.value = null
@@ -670,22 +736,38 @@ watch(query, (q) => {
   if (!MAPS_KEY || q.trim().length < 2) { suggestions.value = []; return }
   searchTimer = setTimeout(() => searchPlaces(q.trim()), 300)
 })
+// 위쪽 검색창과 일정 고치기 창의 장소 검색이 같이 쓴다
+async function fetchSuggestions(q) {
+  const maps = await loadMaps()
+  const { AutocompleteSuggestion, AutocompleteSessionToken } = await maps.importLibrary('places')
+  if (!sessionToken) sessionToken = new AutocompleteSessionToken()
+  const req = { input: q, sessionToken, language: 'ko' }
+  if (map) req.locationBias = map.getCenter()
+  const { suggestions: list } = await AutocompleteSuggestion.fetchAutocompleteSuggestions(req)
+  return (list || []).filter(s => s.placePrediction).slice(0, 5).map(s => ({
+    pred: s.placePrediction,
+    main: s.placePrediction.mainText?.text || s.placePrediction.text?.text || '',
+    second: s.placePrediction.secondaryText?.text || '',
+    types: s.placePrediction.types || [],
+  }))
+}
+// 고른 검색 결과 → trip_places에 넣을 값 (위치·주소만 상세 조회)
+async function placeRowOf(s) {
+  const place = s.pred.toPlace()
+  await place.fetchFields({ fields: ['location', 'formattedAddress'] })
+  const pid = place.id || s.pred.placeId
+  return {
+    name: s.main, category: catFromTypes(s.types), address: place.formattedAddress || s.second,
+    lat: place.location?.lat() ?? null, lng: place.location?.lng() ?? null, place_id: pid,
+    map_url: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(s.main)}&query_place_id=${pid}`,
+  }
+}
 async function searchPlaces(q) {
   try {
     searching.value = true
-    const maps = await loadMaps()
-    const { AutocompleteSuggestion, AutocompleteSessionToken } = await maps.importLibrary('places')
-    if (!sessionToken) sessionToken = new AutocompleteSessionToken()
-    const req = { input: q, sessionToken, language: 'ko' }
-    if (map) req.locationBias = map.getCenter()
-    const { suggestions: list } = await AutocompleteSuggestion.fetchAutocompleteSuggestions(req)
+    const list = await fetchSuggestions(q)
     if (query.value.trim() !== q) return
-    suggestions.value = (list || []).filter(s => s.placePrediction).slice(0, 5).map(s => ({
-      pred: s.placePrediction,
-      main: s.placePrediction.mainText?.text || s.placePrediction.text?.text || '',
-      second: s.placePrediction.secondaryText?.text || '',
-      types: s.placePrediction.types || [],
-    }))
+    suggestions.value = list
   } catch (e) {
     mapError.value = `장소 검색 실패: ${e.message || e}`
     suggestions.value = []
@@ -709,14 +791,7 @@ async function addPlace(row) {
 async function pickSuggestion(s) {
   busy.value = true
   try {
-    const place = s.pred.toPlace()
-    await place.fetchFields({ fields: ['location', 'formattedAddress'] })
-    const pid = place.id || s.pred.placeId
-    const p = await addPlace({
-      name: s.main, category: catFromTypes(s.types), address: place.formattedAddress || s.second,
-      lat: place.location?.lat() ?? null, lng: place.location?.lng() ?? null, place_id: pid,
-      map_url: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(s.main)}&query_place_id=${pid}`,
-    })
+    const p = await addPlace(await placeRowOf(s))
     if (p && !toTray.value) await trayToDay(p)
   } catch (e) {
     alert(`장소 정보를 받지 못했습니다: ${e.message || e}`)
@@ -737,26 +812,91 @@ async function quickAdd() {
 }
 
 // ── 경비 ────────────────────────────────────────────────────
+// trip_expenses 한 줄: kind = spend(지출) / deposit(공금 넣기), planned = 예정(아직 안 냄),
+// paid_by = 낸 사람 members.id / 'pot'(공금) / null, split_with = 나눌 사람 id 목록 (null이면 모두).
+// 금액 계산은 모두 원화 환산(amount_krw)으로 한다.
 const cur = computed(() => curOf(trip.value?.currency || 'KRW'))
-const used = computed(() => expenses.value.reduce((s, x) => s + (Number(x.amount_krw) || 0), 0))
-const budgetLeft = computed(() => (Number(trip.value?.budget) || 0) - used.value)
+const MEMBER_COLORS = ['#0f7c8c', '#e8890c', '#7a5af0', '#d6336c', '#2f9e44', '#3b82c4', '#b08a3a', '#495057']
+const members = computed(() => (Array.isArray(trip.value?.members) ? trip.value.members : []))
+const multi = computed(() => members.value.length >= 2)   // 2명 이상일 때만 낸 사람·공금·정산을 보여 준다
+const memberById = (id) => members.value.find(m => m.id === id)
+const memberColor = (id) => MEMBER_COLORS[Math.max(0, members.value.findIndex(m => m.id === id)) % MEMBER_COLORS.length]
+const krw = (x) => Number(x.amount_krw) || 0
+const isSpend = (x) => (x.kind || 'spend') === 'spend'
+const spends = computed(() => expenses.value.filter(x => isSpend(x) && !x.planned))
+const plannedList = computed(() => expenses.value.filter(x => isSpend(x) && x.planned))
+const deposits = computed(() => expenses.value.filter(x => x.kind === 'deposit'))
+const used = computed(() => spends.value.reduce((s, x) => s + krw(x), 0))
+const plannedSum = computed(() => plannedList.value.reduce((s, x) => s + krw(x), 0))
+const budgetLeft = computed(() => (Number(trip.value?.budget) || 0) - used.value - plannedSum.value)
 const usedPct = computed(() => trip.value?.budget ? Math.min(100, Math.round(used.value / trip.value.budget * 100)) : 0)
+const plannedPct = computed(() => trip.value?.budget ? Math.min(100 - usedPct.value, Math.round(plannedSum.value / trip.value.budget * 100)) : 0)
 const byCat = computed(() => {
   const m = {}
-  expenses.value.forEach(x => { m[x.category] = (m[x.category] || 0) + (Number(x.amount_krw) || 0) })
+  spends.value.forEach(x => { m[x.category] = (m[x.category] || 0) + krw(x) })
   return EXP_CATS.filter(c => m[c]).map(c => ({ c, v: m[c], pct: used.value ? Math.round(m[c] / used.value * 100) : 0, color: EXP_COLORS[c] }))
 })
+// 낸 돈·공금 넣은 돈을 날짜별로. 출발 전 날짜는 '출발 전'으로 묶는다 (미리 낸 항공권·숙소 등)
 const expByDay = computed(() => {
   const groups = []
-  expenses.value.forEach(x => {
-    const key = x.spent_on || ''
+  const start = trip.value?.start_date || ''
+  expenses.value.filter(x => !x.planned || !isSpend(x)).forEach(x => {
+    const key = x.spent_on && start && x.spent_on < start ? 'before' : (x.spent_on || '')
     let g = groups.find(g => g.key === key)
     if (!g) { g = { key, items: [], total: 0 }; groups.push(g) }
-    g.items.push(x); g.total += Number(x.amount_krw) || 0
+    g.items.push(x); if (isSpend(x)) g.total += krw(x)
   })
   return groups
 })
+// 공금: 넣은 돈 − 공금으로 낸 돈
+const potIn = computed(() => deposits.value.reduce((s, x) => s + krw(x), 0))
+const potOut = computed(() => spends.value.filter(x => x.paid_by === 'pot').reduce((s, x) => s + krw(x), 0))
+const potLeft = computed(() => potIn.value - potOut.value)
+// 정산 (예정은 뺀다). 사람마다 '낸 돈 + 공금에 넣은 돈 − 자기 몫'. 공금도 한 사람처럼 셈에 넣어
+// 남은 공금은 돌려받을 사람에게 먼저 가게 한다. 낸 사람이 안 정해진 지출은 셈에서 뺀다.
+const settle = computed(() => {
+  if (!multi.value) return null
+  const ids = members.value.map(m => m.id)
+  const net = Object.fromEntries([...ids, 'pot'].map(id => [id, 0]))
+  const share = Object.fromEntries(ids.map(id => [id, 0]))
+  let skipped = 0
+  for (const x of deposits.value) {
+    if (!ids.includes(x.paid_by)) { skipped++; continue }
+    net[x.paid_by] += krw(x); net.pot -= krw(x)
+  }
+  for (const x of spends.value) {
+    const payer = x.paid_by === 'pot' || ids.includes(x.paid_by) ? x.paid_by : null
+    if (!payer) { skipped++; continue }
+    const listed = Array.isArray(x.split_with) ? x.split_with.filter(id => ids.includes(id)) : []
+    const who = listed.length ? listed : ids
+    net[payer] += krw(x)
+    who.forEach(id => { share[id] += krw(x) / who.length; net[id] -= krw(x) / who.length })
+  }
+  // 받을 쪽·보낼 쪽을 큰 금액부터 맞춰 나간다
+  const cred = Object.entries(net).filter(([, v]) => v >= 1).map(([id, v]) => ({ id, v })).sort((a, b) => b.v - a.v)
+  const debt = Object.entries(net).filter(([, v]) => v <= -1).map(([id, v]) => ({ id, v: -v })).sort((a, b) => b.v - a.v)
+  const moves = []
+  let i = 0, j = 0
+  while (i < debt.length && j < cred.length) {
+    const v = Math.min(debt[i].v, cred[j].v)
+    if (Math.round(v) >= 1) moves.push({ from: debt[i].id, to: cred[j].id, v: Math.round(v) })
+    debt[i].v -= v; cred[j].v -= v
+    if (debt[i].v < 1) i++
+    if (cred[j].v < 1) j++
+  }
+  return { rows: ids.map(id => ({ id, name: memberById(id).name, share: Math.round(share[id]), net: Math.round(net[id]) })), moves, skipped }
+})
+const whoName = (id) => (id === 'pot' ? '공금' : memberById(id)?.name || '?')
+// 목록에 붙는 '누가 냄 · 누구와 나눔'
+function payLabel(x) {
+  if (x.kind === 'deposit') return whoName(x.paid_by)
+  const payer = x.paid_by === 'pot' ? '공금' : memberById(x.paid_by) ? `${memberById(x.paid_by).name} 냄` : '낸 사람 없음'
+  const listed = Array.isArray(x.split_with) ? x.split_with.filter(id => memberById(id)) : []
+  const split = !listed.length || listed.length === members.value.length ? '모두' : listed.length === 1 ? `${whoName(listed[0])}만` : `${listed.length}명`
+  return `${payer} · ${split}`
+}
 const dayTitle = (ymd) => {
+  if (ymd === 'before') return '출발 전 (미리 낸 돈)'
   if (!ymd) return '날짜 없음'
   const d = dayOf(ymd)
   return d ? `DAY ${d.n} · ${mmdd(ymd)}` : mmdd(ymd)
@@ -769,11 +909,66 @@ const fxText = computed(() => {
   return `${per}${cur.value.name} = ${fmt(t.fx_rate * per)}원`
 })
 const amountText = (x) => x.currency === 'KRW' ? `${fmt(x.amount)}원` : `${curOf(x.currency).sym}${Number(x.amount).toLocaleString()}`
-const expForm = ref(null)
+const expForm = ref(null)   // split: 나눌 사람 id 목록 (창에서는 늘 목록, 저장할 때 모두면 null)
+const allIds = () => members.value.map(m => m.id)
 function openExpForm(x) {
-  if (x) { expForm.value = { ...x }; return }
+  if (x) {
+    const listed = Array.isArray(x.split_with) ? x.split_with.filter(id => memberById(id)) : []
+    expForm.value = { ...x, kind: x.kind || 'spend', planned: !!x.planned, split: listed.length ? listed : allIds() }
+    return
+  }
   const local = trip.value.currency !== 'KRW' && trip.value.fx_rate
-  expForm.value = { id: null, title: '', amount: '', currency: local ? trip.value.currency : 'KRW', category: '식비', spent_on: dayYmd.value || todayYmd() }
+  // 낸 사람 기본값: 공금이 있으면 공금, 없으면 첫 사람
+  const payer = multi.value ? (deposits.value.length ? 'pot' : members.value[0].id) : null
+  expForm.value = { id: null, kind: 'spend', planned: false, paid_by: payer, split: allIds(), title: '', amount: '', currency: local ? trip.value.currency : 'KRW', category: '식비', spent_on: dayYmd.value || todayYmd() }
+}
+function setExpKind(kind) {
+  const f = expForm.value
+  f.kind = kind
+  // 공금은 사람이 넣는다 → 낸 사람이 공금이면 첫 사람으로
+  if (kind === 'deposit' && !memberById(f.paid_by)) f.paid_by = members.value[0]?.id ?? null
+}
+function toggleSplit(id) {
+  const s = expForm.value.split
+  const i = s.indexOf(id)
+  if (i >= 0) { if (s.length > 1) s.splice(i, 1) } else s.push(id)   // 적어도 한 명은 남긴다
+}
+// '냈어요': 예정 → 쓴 돈
+async function markPaid(x) {
+  const res = await db.from('trip_expenses').update({ planned: false }).eq('id', x.id).select().single()
+  if (res.error) return fail('경비 저장', res.error)
+  // 목록 안의 줄을 바꿔 끼워야 화면이 따라온다 (걸러 낸 목록의 줄을 고치면 안 따라옴)
+  const i = expenses.value.findIndex(e => e.id === x.id)
+  if (i >= 0) expenses.value[i] = res.data
+}
+
+// 같이 가는 사람 편집 (trips.members)
+const memberForm = ref(null)
+function openMemberForm() { memberForm.value = { list: members.value.map(m => ({ ...m })), input: '' } }
+function addMember() {
+  const f = memberForm.value
+  const name = f.input.trim()
+  if (!name) return
+  f.list.push({ id: 'm' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name })
+  f.input = ''
+}
+function removeMember(i) {
+  const m = memberForm.value.list[i]
+  const n = expenses.value.filter(x => x.paid_by === m.id || (Array.isArray(x.split_with) && x.split_with.includes(m.id))).length
+  if (n && !confirm(`'${m.name}'이(가) 들어간 경비가 ${n}건 있습니다.\n빼면 그 사람이 낸 돈은 정산에서 빠지고, 나눌 사람에서도 빠집니다.\n\n뺄까요?`)) return
+  memberForm.value.list.splice(i, 1)
+}
+async function saveMembers() {
+  const f = memberForm.value
+  if (f.input.trim()) addMember()   // 칸에 써 두고 저장만 눌러도 들어가게
+  const list = f.list.map(m => ({ id: m.id, name: m.name.trim() })).filter(m => m.name)
+  busy.value = true
+  const res = await db.from('trips').update({ members: list }).eq('id', tripId.value).select().single()
+  busy.value = false
+  if (res.error) return fail('같이 가는 사람 저장', res.error)
+  const i = trips.value.findIndex(t => t.id === res.data.id)
+  if (i >= 0) trips.value[i] = res.data
+  memberForm.value = null
 }
 const expKrwPreview = computed(() => {
   const f = expForm.value
@@ -783,13 +978,23 @@ const expKrwPreview = computed(() => {
 })
 async function saveExp() {
   const f = expForm.value
-  if (!f.title.trim()) return alert('어디에 썼는지 적어 주세요')
+  const dep = f.kind === 'deposit'
+  if (!dep && !f.title.trim()) return alert('어디에 썼는지 적어 주세요')
+  if (dep && !memberById(f.paid_by)) return alert('누가 넣었는지 골라 주세요')
   if (!Number(f.amount)) return alert('금액을 적어 주세요')
   if (f.currency !== 'KRW' && !trip.value.fx_rate) return alert('여행 설정(⚙️)에서 환율을 먼저 넣어 주세요')
   // 금액·통화를 안 바꿨으면 처음 환산한 원화를 그대로 둔다 (환율을 바꿔도 지난 지출은 그대로)
   const orig = f.id && expenses.value.find(x => x.id === f.id)
   const sameMoney = orig && Number(orig.amount) === Number(f.amount) && orig.currency === f.currency
-  const row = { title: f.title.trim(), amount: Number(f.amount), currency: f.currency, category: f.category, spent_on: f.spent_on || null, amount_krw: sameMoney ? orig.amount_krw : Math.round(expKrwPreview.value) }
+  const allSplit = f.split.length >= members.value.length
+  const row = {
+    title: f.title.trim() || '공금 넣음', amount: Number(f.amount), currency: f.currency,
+    category: dep ? '기타' : f.category, spent_on: f.spent_on || null,
+    amount_krw: sameMoney ? orig.amount_krw : Math.round(expKrwPreview.value),
+    kind: f.kind, planned: dep ? false : !!f.planned,
+    paid_by: f.paid_by ?? null,
+    split_with: dep || !multi.value || allSplit ? null : [...f.split],
+  }
   busy.value = true
   const res = f.id
     ? await db.from('trip_expenses').update(row).eq('id', f.id).select().single()
@@ -803,7 +1008,7 @@ async function saveExp() {
 }
 async function deleteExp() {
   const f = expForm.value
-  if (!confirm(`'${f.title}' 지출을 삭제할까요?`)) return
+  if (!confirm(`'${f.title}' ${f.kind === 'deposit' ? '공금 기록' : '지출'}을 삭제할까요?`)) return
   const { error } = await db.from('trip_expenses').delete().eq('id', f.id)
   if (error) return fail('경비 삭제', error)
   expenses.value = expenses.value.filter(x => x.id !== f.id)
@@ -874,7 +1079,7 @@ const APP_TABS = [['home', '🏠 홈'], ['checklist', '✅ 체크리스트'], ['
 // ── 뒤로가기 ────────────────────────────────────────────────
 // 여행 화면·입력 창을 열 때 브라우저 기록을 하나씩 쌓아 둔다.
 // 뒤로가기: 입력 창 닫기 → 여행 목록 → (목록에선) 앱 밖으로
-const anySheet = computed(() => !!(tripForm.value || itemForm.value || legForm.value || placeForm.value || expForm.value || packForm.value))
+const anySheet = computed(() => !!(tripForm.value || itemForm.value || legForm.value || placeForm.value || expForm.value || packForm.value || memberForm.value))
 let histDepth = 0   // 지금 쌓아 둔 기록 수
 let skipPop = 0     // 화면 버튼으로 닫으며 기록을 되돌린 횟수 (그때 오는 popstate는 무시)
 watch([view, anySheet], () => {
@@ -886,7 +1091,7 @@ function onPop() {
   if (skipPop) { skipPop--; return }
   if (!histDepth) return
   histDepth--
-  if (anySheet.value) { tripForm.value = itemForm.value = legForm.value = placeForm.value = expForm.value = packForm.value = null }
+  if (anySheet.value) { tripForm.value = itemForm.value = legForm.value = placeForm.value = expForm.value = packForm.value = memberForm.value = null }
   else if (view.value === 'detail') backToList()
 }
 
@@ -1143,14 +1348,44 @@ onUnmounted(() => {
       <!-- 경비 -->
       <section v-if="sub === 'money'" class="pane">
         <div class="wallet">
-          <div class="w-lbl">{{ trip.budget ? '남은 예산' : '쓴 돈' }}</div>
+          <div class="w-lbl">{{ trip.budget ? (plannedSum ? '남은 예산 (예정 포함)' : '남은 예산') : '쓴 돈' }}</div>
           <div class="w-big mono" :class="{ over: trip.budget && budgetLeft < 0 }">₩{{ fmt(trip.budget ? budgetLeft : used) }}</div>
           <template v-if="trip.budget">
-            <div class="gauge dark"><i :style="{ width: usedPct + '%' }"></i></div>
-            <div class="w-row mono"><span>예산 {{ fmt(trip.budget) }}</span><span>사용 {{ fmt(used) }}</span></div>
+            <div class="gauge dark two"><i :style="{ width: usedPct + '%' }"></i><i class="pl" :style="{ width: plannedPct + '%' }"></i></div>
+            <div class="w-row mono"><span>예산 {{ fmt(trip.budget) }}</span><span>사용 {{ fmt(used) }}<template v-if="plannedSum"> · 예정 {{ fmt(plannedSum) }}</template></span></div>
           </template>
+          <div v-else-if="plannedSum" class="w-row mono"><span></span><span>예정 {{ fmt(plannedSum) }}</span></div>
+        </div>
+        <!-- 같이 가는 사람 -->
+        <button class="people" @click="openMemberForm">
+          <span class="ppl-l">같이 가는 사람</span>
+          <template v-if="members.length">
+            <span v-for="m in members" :key="m.id" class="av" :style="{ background: memberColor(m.id) }" :title="m.name">{{ m.name.slice(0, 1) }}</span>
+          </template>
+          <span v-else class="ppl-hint">넣으면 낸 사람·공금·정산</span>
+          <b>{{ members.length ? '편집' : '넣기' }}</b>
+        </button>
+        <div v-if="multi && (deposits.length || potOut)" class="pot">👛 공금 <span class="pot-s mono">넣은 돈 {{ fmt(potIn) }} · 쓴 돈 {{ fmt(potOut) }}</span><b class="mono" :class="{ over: potLeft < 0 }">{{ fmt(potLeft) }}원</b></div>
+        <div v-if="settle && (spends.length || deposits.length)" class="receipt settle">
+          <div class="r-h"><span>정산 (예정 빼고)</span><span>{{ settle.moves.length ? `보낼 돈 ${settle.moves.length}건` : '맞음' }}</span></div>
+          <div v-for="r in settle.rows" :key="r.id" class="st-p">
+            <span class="av" :style="{ background: memberColor(r.id) }">{{ r.name.slice(0, 1) }}</span>
+            <span class="st-n">{{ r.name }} <small class="mono">몫 {{ fmt(r.share) }}</small></span>
+            <span class="mono" :class="r.net > 0 ? 'plus' : r.net < 0 ? 'minus' : ''">{{ r.net > 0 ? '+' : r.net < 0 ? '−' : '' }}{{ fmt(Math.abs(r.net)) }}</span>
+          </div>
+          <div v-for="(t, i) in settle.moves" :key="i" class="st-tr">{{ t.from === 'pot' ? '공금 남은 돈' : whoName(t.from) }} → {{ t.to === 'pot' ? '공금 채우기' : whoName(t.to) }}<b class="mono">{{ fmt(t.v) }}원</b></div>
+          <div v-if="settle.skipped" class="st-skip">낸 사람이 안 정해진 {{ settle.skipped }}건은 정산에서 뺐습니다</div>
         </div>
         <div v-if="fxText" class="fx" @click="openTripForm(trip)">💱 <span class="mono">{{ fxText }}</span><span class="fx-sub">직접 입력</span><span class="fx-edit">바꾸기</span></div>
+        <div v-if="plannedList.length" class="receipt plan">
+          <div class="r-h"><span>예정 (아직 안 냄)</span><span class="mono">{{ fmt(plannedSum) }}원</span></div>
+          <div v-for="x in plannedList" :key="x.id" class="line" @click="openExpForm(x)">
+            <span class="k" :style="{ background: EXP_COLORS[x.category] }">{{ x.category }}</span>
+            <span class="line-t">{{ x.title }}</span>
+            <span class="amt mono">{{ amountText(x) }}<small v-if="multi">{{ payLabel(x) }}</small></span>
+            <button class="paid-btn" @click.stop="markPaid(x)">냈어요</button>
+          </div>
+        </div>
         <div v-if="byCat.length" class="receipt">
           <div class="r-h"><span>항목별</span><span class="mono">{{ fmt(used) }}원</span></div>
           <div class="stack"><i v-for="b in byCat" :key="b.c" :style="{ flex: b.v, background: b.color }"></i></div>
@@ -1159,10 +1394,11 @@ onUnmounted(() => {
         <div v-if="!expenses.length" class="trv-empty small">쓴 돈을 + 로 적어 두세요</div>
         <div v-for="g in expByDay" :key="g.key" class="receipt">
           <div class="r-h"><span>{{ dayTitle(g.key) }}</span><span class="mono">{{ fmt(g.total) }}원</span></div>
-          <div v-for="x in g.items" :key="x.id" class="line" @click="openExpForm(x)">
-            <span class="k" :style="{ background: EXP_COLORS[x.category] }">{{ x.category }}</span>
+          <div v-for="x in g.items" :key="x.id" class="line" :class="{ dep: x.kind === 'deposit' }" @click="openExpForm(x)">
+            <span v-if="x.kind === 'deposit'" class="k pot-k">공금</span>
+            <span v-else class="k" :style="{ background: EXP_COLORS[x.category] }">{{ x.category }}</span>
             <span class="line-t">{{ x.title }}</span>
-            <span class="amt mono">{{ amountText(x) }}<small v-if="x.currency !== 'KRW'">{{ fmt(x.amount_krw) }}원</small></span>
+            <span class="amt mono">{{ x.kind === 'deposit' ? '+' : '' }}{{ amountText(x) }}<small v-if="x.currency !== 'KRW'">{{ fmt(x.amount_krw) }}원</small><small v-if="multi">{{ payLabel(x) }}</small></span>
           </div>
         </div>
       </section>
@@ -1241,7 +1477,27 @@ onUnmounted(() => {
       <div class="sheet">
         <h3>{{ itemForm.id ? '일정 고치기' : '일정 추가' }}</h3>
         <input v-model="itemForm.title" class="f-in" placeholder="일정 (예: 공항 → 호텔)" />
-        <div v-if="itemForm.place?.address" class="f-note">📍 {{ itemForm.place.address }}</div>
+        <div v-if="itemForm.place" class="pl-box">
+          <span>📍</span>
+          <span class="pl-t"><b>{{ itemForm.place.name }}</b><small v-if="itemForm.place.address">{{ itemForm.place.address }}</small></span>
+          <button v-if="MAPS_KEY" class="pl-btn" @click="itemForm.picking = !itemForm.picking">바꾸기</button>
+          <button class="pl-btn g" @click="removeFormPlace">빼기</button>
+        </div>
+        <button v-else-if="MAPS_KEY && !itemForm.picking" class="pl-add" @click="itemForm.picking = true">📍 장소 넣기</button>
+        <div v-if="itemForm.picking" class="pl-pick">
+          <div class="search">
+            <span>🔍</span>
+            <input v-model="formQuery" placeholder="장소 검색" aria-label="장소 검색" />
+            <button class="tray-toggle" @click="itemForm.picking = false; formQuery = ''">닫기</button>
+          </div>
+          <div v-if="formSugg.length || formSearching" class="sugg-box inline">
+            <div v-if="formSearching && !formSugg.length" class="sugg-empty">찾는 중...</div>
+            <button v-for="s in formSugg" :key="s.pred.placeId" class="sugg" :disabled="busy" @click="pickFormPlace(s)">
+              <b>{{ s.main }}</b><span>{{ s.second }}</span>
+            </button>
+          </div>
+        </div>
+        <div v-if="itemForm.placeEdited" class="f-note">저장을 눌러야 장소가 바뀝니다</div>
         <div class="f-row">
           <label class="f-lab">날짜
             <select v-model="itemForm.day_date" class="f-in">
@@ -1259,7 +1515,7 @@ onUnmounted(() => {
         <input v-model="itemForm.memo" class="f-in" placeholder="메모 (예약번호, 요금 등)" />
         <div class="f-act">
           <button v-if="itemForm.id" class="f-del" @click="deleteItem">삭제</button>
-          <button v-if="itemForm.id && itemForm.place" class="f-cancel" @click="itemToTray">담아 두기로</button>
+          <button v-if="itemForm.id && itemForm.place && !itemForm.placeEdited" class="f-cancel" @click="itemToTray">담아 두기로</button>
           <button class="f-cancel" @click="itemForm = null">취소</button>
           <button class="f-ok" :disabled="busy" @click="saveItem">저장</button>
         </div>
@@ -1311,8 +1567,19 @@ onUnmounted(() => {
     <!-- 경비 추가·수정 -->
     <div v-if="expForm" class="sheet-bg" @click.self="expForm = null">
       <div class="sheet">
-        <h3>{{ expForm.id ? '지출 고치기' : '지출 추가' }}</h3>
-        <input v-model="expForm.title" class="f-in" placeholder="어디에 (예: 점심)" />
+        <h3>{{ expForm.id ? (expForm.kind === 'deposit' ? '공금 고치기' : '지출 고치기') : '추가' }}</h3>
+        <div v-if="multi && !expForm.id" class="seg">
+          <button :class="{ on: expForm.kind === 'spend' }" @click="setExpKind('spend')">지출</button>
+          <button :class="{ on: expForm.kind === 'deposit' }" @click="setExpKind('deposit')">공금 넣기</button>
+        </div>
+        <template v-if="expForm.kind === 'deposit'">
+          <div class="f-lab">누가 넣었나요</div>
+          <div class="chips pay">
+            <button v-for="m in members" :key="m.id" :class="{ on: expForm.paid_by === m.id }" :style="{ '--c': memberColor(m.id) }" @click="expForm.paid_by = m.id">{{ m.name }}</button>
+          </div>
+          <input v-model="expForm.title" class="f-in" placeholder="메모 (선택, 예: 환전한 엔화)" />
+        </template>
+        <input v-else v-model="expForm.title" class="f-in" placeholder="어디에 (예: 점심)" />
         <div class="f-row">
           <input v-model="expForm.amount" type="number" inputmode="decimal" class="f-in mono" placeholder="금액" />
           <select v-model="expForm.currency" class="f-in" style="max-width:120px">
@@ -1321,14 +1588,49 @@ onUnmounted(() => {
           </select>
         </div>
         <div v-if="expForm.currency !== 'KRW'" class="f-note mono">≈ {{ fmt(expKrwPreview) }}원 ({{ fxText }})</div>
-        <div class="chips">
-          <button v-for="c in EXP_CATS" :key="c" :class="{ on: expForm.category === c }" :style="{ '--c': EXP_COLORS[c] }" @click="expForm.category = c">{{ c }}</button>
-        </div>
+        <template v-if="expForm.kind !== 'deposit'">
+          <div class="chips">
+            <button v-for="c in EXP_CATS" :key="c" :class="{ on: expForm.category === c }" :style="{ '--c': EXP_COLORS[c] }" @click="expForm.category = c">{{ c }}</button>
+          </div>
+          <template v-if="multi">
+            <div class="f-lab">낸 사람</div>
+            <div class="chips pay">
+              <button :class="{ on: expForm.paid_by === 'pot' }" style="--c:#b08a3a" @click="expForm.paid_by = 'pot'">👛 공금</button>
+              <button v-for="m in members" :key="m.id" :class="{ on: expForm.paid_by === m.id }" :style="{ '--c': memberColor(m.id) }" @click="expForm.paid_by = m.id">{{ m.name }}</button>
+            </div>
+            <div class="f-lab">나눌 사람 <small>(기본: 모두)</small></div>
+            <div class="chips split">
+              <button v-for="m in members" :key="m.id" :class="{ on: expForm.split.includes(m.id) }" @click="toggleSplit(m.id)">{{ expForm.split.includes(m.id) ? '✓ ' : '' }}{{ m.name }}</button>
+            </div>
+          </template>
+          <label class="plan-tg"><input v-model="expForm.planned" type="checkbox" /> ⏳ 아직 안 냈어요 (예정)</label>
+        </template>
         <label class="f-lab">날짜<input v-model="expForm.spent_on" type="date" class="f-in" /></label>
         <div class="f-act">
           <button v-if="expForm.id" class="f-del" @click="deleteExp">삭제</button>
           <button class="f-cancel" @click="expForm = null">취소</button>
           <button class="f-ok" :disabled="busy" @click="saveExp">저장</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 같이 가는 사람 -->
+    <div v-if="memberForm" class="sheet-bg" @click.self="memberForm = null">
+      <div class="sheet">
+        <h3>같이 가는 사람</h3>
+        <div class="f-note">2명 이상이면 지출마다 낸 사람·나눌 사람을 고르고, 공금과 정산을 볼 수 있습니다</div>
+        <div v-for="(m, i) in memberForm.list" :key="m.id" class="mb-row">
+          <span class="av" :style="{ background: MEMBER_COLORS[i % MEMBER_COLORS.length] }">{{ m.name.trim().slice(0, 1) || '?' }}</span>
+          <input v-model="m.name" class="f-in" aria-label="이름" />
+          <button class="ck-del" aria-label="빼기" @click="removeMember(i)">✕</button>
+        </div>
+        <div class="f-row">
+          <input v-model="memberForm.input" class="f-in" placeholder="이름 (예: 민수)" @keyup.enter="addMember" />
+          <button class="pk-add" :disabled="!memberForm.input.trim()" @click="addMember">추가</button>
+        </div>
+        <div class="f-act">
+          <button class="f-cancel" @click="memberForm = null">취소</button>
+          <button class="f-ok" :disabled="busy" @click="saveMembers">저장</button>
         </div>
       </div>
     </div>
@@ -1456,6 +1758,15 @@ button { font: inherit; color: inherit; }
 .sugg:hover { background: #f3f7f9; }
 .sugg b { font-size: 14px; } .sugg span { font-size: 12px; color: var(--sub); }
 .sugg-empty { font-size: 12px; color: var(--sub); padding: 9px 10px; }
+.sugg-box.inline { position: static; margin-top: 4px; }
+/* 일정 고치기 창의 장소 */
+.pl-box { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 12px; padding: 9px 11px; background: #f8fafb; }
+.pl-t { flex: 1; min-width: 0; }
+.pl-t b { display: block; font-size: 14px; }
+.pl-t small { display: block; font-size: 12px; color: var(--sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pl-btn { flex-shrink: 0; border: none; font-size: 12px; font-weight: 700; color: var(--lagoon); background: var(--lagoon-soft); border-radius: 8px; padding: 6px 9px; cursor: pointer; }
+.pl-btn.g { color: var(--sub); background: #eef2f4; }
+.pl-add { border: 1px dashed var(--line); background: #fff; border-radius: 12px; padding: 10px; font-size: 13px; color: var(--lagoon); font-weight: 700; cursor: pointer; text-align: left; }
 
 .rows { min-height: 40px; border-radius: 12px; }
 .rows.drop { box-shadow: inset 0 0 0 2px var(--lagoon); background: var(--lagoon-soft); }
@@ -1513,6 +1824,36 @@ button { font: inherit; color: inherit; }
 .line-t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .amt { margin-left: auto; text-align: right; white-space: nowrap; }
 .amt small { display: block; color: var(--faint); font-size: 11px; }
+.gauge.two { display: flex; }
+.gauge.dark i.pl { background: rgba(240,160,32,.4); }
+/* 같이 가는 사람·공금·정산·예정 */
+.av { width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; color: #fff; flex-shrink: 0; }
+.people { width: 100%; display: flex; align-items: center; gap: 6px; background: #fff; border: none; border-radius: 12px; padding: 8px 12px; margin-bottom: 10px; font-size: 12px; color: var(--sub); cursor: pointer; text-align: left; }
+.ppl-l { margin-right: 4px; }
+.ppl-hint { color: var(--faint); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.people b { margin-left: auto; color: var(--lagoon); flex-shrink: 0; }
+.pot { display: flex; align-items: center; gap: 8px; background: var(--sun-soft); border-radius: 12px; padding: 9px 12px; font-size: 12px; color: #7a5200; margin-bottom: 10px; }
+.pot-s { opacity: .75; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pot b { margin-left: auto; font-size: 13px; white-space: nowrap; }
+.pot b.over { color: var(--red); }
+.st-p { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: 13px; }
+.st-n { flex: 1; min-width: 0; }
+.st-n small { color: var(--faint); font-size: 11px; margin-left: 4px; }
+.plus { color: var(--lagoon); font-weight: 700; } .minus { color: var(--red); font-weight: 700; }
+.st-tr { display: flex; align-items: center; gap: 6px; background: #f6f9fa; border-radius: 9px; padding: 8px 10px; margin-top: 6px; font-size: 13px; }
+.st-tr b { margin-left: auto; white-space: nowrap; }
+.st-skip { font-size: 11px; color: var(--sub); margin-top: 8px; }
+.receipt.plan .line-t, .receipt.plan .amt { color: var(--sub); }
+.paid-btn { flex-shrink: 0; border: none; background: var(--lagoon-soft); color: var(--lagoon); font-weight: 700; font-size: 11px; border-radius: 8px; padding: 5px 8px; cursor: pointer; align-self: center; }
+.pot-k { background: #b08a3a; }
+.line.dep .amt { color: #7a5200; }
+.seg { display: flex; background: #eef2f4; border-radius: 10px; padding: 3px; }
+.seg button { flex: 1; border: none; background: none; border-radius: 8px; padding: 8px 0; font-size: 13px; color: var(--sub); cursor: pointer; }
+.seg button.on { background: #fff; color: var(--ink); font-weight: 700; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+.chips.split button.on { background: var(--lagoon-soft); border-color: var(--lagoon); color: var(--lagoon); font-weight: 700; }
+.plan-tg { display: flex; align-items: center; gap: 8px; font-size: 13px; background: #f8fafb; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; cursor: pointer; }
+.plan-tg input { width: 18px; height: 18px; accent-color: var(--lagoon); margin: 0; }
+.mb-row { display: flex; align-items: center; gap: 8px; }
 
 /* ── 준비물 ── */
 .stamp { display: flex; align-items: center; gap: 12px; background: #fff; border-radius: 14px; padding: 12px 14px; margin-bottom: 10px; }
